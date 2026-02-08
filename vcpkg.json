@@ -1,0 +1,10 @@
+{
+  "name": "redline",
+  "version-string": "0.1.0",
+  "description": "Shared-memory message bus for same-host IPC",
+  "dependencies": [
+    "gtest",
+    "benchmark",
+    "glog"
+  ]
+}

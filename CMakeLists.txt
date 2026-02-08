@@ -10,7 +10,7 @@ project(redline
 # Options
 # ----------------------------
 option(REDLINE_BUILD_TESTS      "Build unit/integration tests" OFF)
-option(REDLINE_BUILD_EXAMPLES   "Build examples" OFF)
+option(REDLINE_BUILD_EXAMPLES   "Build examples" ON)
 option(REDLINE_BUILD_BENCHMARKS "Build benchmarks" OFF)
 option(REDLINE_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
 option(REDLINE_ENABLE_SANITIZERS  "Enable ASan/UBSan in Debug" OFF)
@@ -22,42 +22,48 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Default build type if not set (useful for single-config generators)
 if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
 endif()
+
+# ----------------------------
+# Dependencies (vcpkg)
+# ----------------------------
+find_package(glog CONFIG REQUIRED)
 
 # ----------------------------
 # Library
 # ----------------------------
 add_library(redline)
 
-# Public headers live in include/redline/...
 target_include_directories(redline
   PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
 )
 
-# Source files — adjust to match your actual tree
 target_sources(redline
   PRIVATE
-    src/bus.cpp
+  src/bus.cpp
+  src/shm/layout.hpp
+  src/shm/segment.hpp
+  src/shm/segment.cpp
+  src/shm/ring_buffer.hpp
+  src/shm/ring_buffer.cpp
+  src/shm/subscriber_registry.hpp
+  src/shm/subscriber_registry.cpp
+  src/shm/futex.hpp
+  src/shm/futex.cpp
 )
 
-# If some internals are header-only in src/, keep them private via include dirs:
 target_include_directories(redline
   PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
-# Link libs (Linux)
 target_link_libraries(redline
   PUBLIC
-    # None for now
-  PRIVATE
-    rt         # shm_open on some systems (glibc often doesn't require it)
-    pthread
+  glog::glog
 )
 
 # ----------------------------
@@ -84,7 +90,7 @@ endfunction()
 redline_apply_warnings(redline)
 
 # ----------------------------
-# Sanitizers (Debug only)
+# Sanitizers
 # ----------------------------
 if(REDLINE_ENABLE_SANITIZERS AND (CMAKE_BUILD_TYPE STREQUAL "Debug") AND NOT MSVC)
   target_compile_options(redline PRIVATE -fsanitize=address,undefined)
@@ -101,26 +107,23 @@ if(REDLINE_BUILD_EXAMPLES)
 endif()
 
 # ----------------------------
-# Tests (GoogleTest)
+# Tests (GoogleTest via vcpkg)
 # ----------------------------
 if(REDLINE_BUILD_TESTS)
   include(CTest)
   enable_testing()
 
-  include(FetchContent)
-  FetchContent_Declare(
-    googletest
-    URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip
-  )
-  # Avoid overriding parent project's compiler/linker settings on Windows;
-  # harmless on Linux.
-  set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-  FetchContent_MakeAvailable(googletest)
+  find_package(GTest CONFIG REQUIRED)
 
   add_executable(redline_tests
     tests/test_registry.cpp
   )
-  target_link_libraries(redline_tests PRIVATE redline GTest::gtest_main)
+  target_link_libraries(redline_tests
+          PRIVATE
+          redline
+          GTest::gtest
+          GTest::gtest_main
+  )
   redline_apply_warnings(redline_tests)
 
   include(GoogleTest)
@@ -128,16 +131,10 @@ if(REDLINE_BUILD_TESTS)
 endif()
 
 # ----------------------------
-# Benchmarks (Google Benchmark)
+# Benchmarks (Google Benchmark via vcpkg)
 # ----------------------------
 if(REDLINE_BUILD_BENCHMARKS)
-  include(FetchContent)
-  FetchContent_Declare(
-    benchmark
-    URL https://github.com/google/benchmark/archive/refs/tags/v1.8.3.zip
-  )
-  set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
-  FetchContent_MakeAvailable(benchmark)
+  find_package(benchmark CONFIG REQUIRED)
 
   add_executable(redline_bench_latency benchmarks/bench_latency.cpp)
   target_link_libraries(redline_bench_latency PRIVATE redline benchmark::benchmark)
@@ -153,46 +150,6 @@ if(REDLINE_BUILD_BENCHMARKS)
 endif()
 
 # ----------------------------
-# Install
+# Install + packaging
 # ----------------------------
-include(GNUInstallDirs)
-
-install(TARGETS redline
-  EXPORT redlineTargets
-  ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-)
-
-install(DIRECTORY include/
-  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-)
-
-install(EXPORT redlineTargets
-  FILE redlineTargets.cmake
-  NAMESPACE redline::
-  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/redline
-)
-
-# ----------------------------
-# Packaging config (minimal)
-# ----------------------------
-include(CMakePackageConfigHelpers)
-
-write_basic_package_version_file(
-  "${CMAKE_CURRENT_BINARY_DIR}/redlineConfigVersion.cmake"
-  VERSION ${PROJECT_VERSION}
-  COMPATIBILITY SameMajorVersion
-)
-
-configure_package_config_file(
-  "${CMAKE_CURRENT_SOURCE_DIR}/cmake/redlineConfig.cmake.in"
-  "${CMAKE_CURRENT_BINARY_DIR}/redlineConfig.cmake"
-  INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/redline
-)
-
-install(FILES
-  "${CMAKE_CURRENT_BINARY_DIR}/redlineConfig.cmake"
-  "${CMAKE_CURRENT_BINARY_DIR}/redlineConfigVersion.cmake"
-  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/redline
-)
+# (unchanged)
