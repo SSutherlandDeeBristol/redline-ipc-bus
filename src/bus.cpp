@@ -7,6 +7,7 @@
 #include "glog/logging.h"
 
 #include "redline/config.hpp"
+#include "redline/utils.hpp"
 #include "shm/futex.hpp"
 #include "shm/layout.hpp"
 #include "shm/ring_buffer.hpp"
@@ -17,7 +18,7 @@ namespace redline {
 class BusImpl : public Bus {
 public:
   BusImpl(const std::string& name, const Config& config)
-      : name_(name), config_(config), consumer_busy_spin_duration_(std::chrono::microseconds(config_.consumer_busy_spin_duration_us)) {
+      : name_(name), config_(config) {
     segment_mapping_ = shm::SegmentMapping::open_or_create("/redline." + name, config);
     segment_ = segment_mapping_->segment();
     ring_buffer_ = std::make_unique<shm::RingBuffer>(segment_mapping_);
@@ -25,20 +26,20 @@ public:
   }
 
   bool publish(const std::span<const uint8_t>& data) override {
-    {
-      const uint64_t write_seq = segment_->write_seq.load(std::memory_order_acquire);
-      const uint64_t slowest_seq = compute_slowest_subscriber_read_seq();
+    const int64_t timestamp_us = now_us();
 
-      // Backpressure check: don't overwrite unread slots
-      if (write_seq - slowest_seq >= segment_->slot_count) {
-        // Handle backpressure: drop message, yield, or spin
-        // For example, drop:
-        LOG_EVERY_T(WARNING, 1.0) << "Blocking message due to backpressure " << "(write_seq: " << write_seq << ", slowest_seq: " << slowest_seq << ")";
-        return false;
-      }
+    const uint64_t write_seq = segment_->write_seq.load(std::memory_order_acquire);
+    const uint64_t slowest_seq = compute_slowest_subscriber_read_seq();
+
+    // Backpressure check: don't overwrite unread slots
+    if (write_seq - slowest_seq >= segment_->slot_count) {
+      // Handle backpressure: drop message, yield, or spin
+      // For example, drop:
+      LOG_EVERY_T(WARNING, 1.0) << "Blocking message due to backpressure " << "(write_seq: " << write_seq << ", slowest_seq: " << slowest_seq << ")";
+      return false;
     }
 
-    const auto push_result = ring_buffer_->try_push(data);
+    const auto push_result = ring_buffer_->try_push(data, timestamp_us);
     if (push_result.result == shm::RingBuffer::WriteResult::OK) {
       std::atomic_uint32_t &slot_state = segment_mapping_->header_at(push_result.write_seq)->state;
       // Wake up all subscribers waiting on this slot
@@ -91,7 +92,6 @@ public:
 private:
   std::string name_;
   Config config_;
-  std::chrono::duration<int64_t, std::micro> consumer_busy_spin_duration_;
 
   std::shared_ptr<shm::SegmentMapping> segment_mapping_;
   shm::SHMSegment* segment_;
@@ -123,81 +123,58 @@ private:
 
   void init_poll_thread() {
     poll_thread_ = std::thread([this]() {
-      auto start = std::chrono::steady_clock::now();
+      auto start = now_benchmark_us();
+
+      auto& subscriber_entry = segment_->subscribers[subscriber_index_];
 
       while (!stop_polling_) {
-        const uint64_t read_seq = segment_->subscribers[subscriber_index_].read_seq.load(std::memory_order_acquire);
+        const uint64_t read_seq = subscriber_entry.read_seq.load(std::memory_order_acquire);
+        auto pop_result = ring_buffer_->try_pop(read_seq);
 
-        auto* header = segment_mapping_->header_at(read_seq);
-
-        const shm::RingBuffer::PopResult pop_result = ring_buffer_->try_pop(read_seq);
-
-        switch (pop_result.result) {
-          case shm::RingBuffer::ReadResult::OK: {
-            // Call the subscriber callback with the message data
-            const size_t callback_count = subscriber_callback_count_.load();
-            for (size_t i = 0; i < callback_count; ++i) {
-              subscriber_callbacks_[i](pop_result.data);
-            }
-
-            // Increment sequence and update last read timestamp before trying to read the next message
-            segment_->subscribers[subscriber_index_].read_seq.fetch_add(1);
-            // Reset start timer so that we can busy spin for the next message...
-            start = std::chrono::steady_clock::now();
-            segment_->subscribers[subscriber_index_].last_read_timestamp = start.time_since_epoch().count();
-            continue;
+        if (pop_result.result == shm::RingBuffer::ReadResult::OK) {
+          // Deliver message
+          const auto callback_count = subscriber_callback_count_.load(std::memory_order_acquire);
+          for (size_t i = 0; i < callback_count; ++i) {
+            subscriber_callbacks_[i](Message{
+              .sequence = read_seq,
+              .data = pop_result.data,
+              .publish_timestamp = pop_result.publish_timestamp_us
+            });
           }
-          case shm::RingBuffer::ReadResult::NOT_COMMITTED_YET:
-          case shm::RingBuffer::ReadResult::EMPTY: {
-            // Busy spin for configured duration then sleep
-            const auto now = std::chrono::steady_clock::now();
+          subscriber_entry.read_seq.fetch_add(1, std::memory_order_release);
+          start = now_benchmark_us();
+          subscriber_entry.last_read_timestamp = start;
+          continue;
+        }
 
-            if (now - start > consumer_busy_spin_duration_) {
-              if (read_seq < segment_->write_seq.load(std::memory_order_acquire)) {
-                // Producer advanced, retry instead of sleeping
-                continue;
-              }
+        const uint64_t write_seq = segment_->write_seq.load(std::memory_order_acquire);
 
-              std::atomic_uint32_t& slot_state = segment_mapping_->header_at(read_seq)->state;
-              // TODO: handle futex errors
-              shm::futex_wait(&slot_state, pop_result.slot_state);
-            }
-            break;
+        if (pop_result.result == shm::RingBuffer::ReadResult::OVERWRITTEN) {
+          const uint64_t new_read_seq = write_seq;
+          subscriber_entry.read_seq.store(new_read_seq, std::memory_order_release);
+          subscriber_entry.dropped_count.fetch_add(new_read_seq - read_seq, std::memory_order_relaxed);
+          continue;
+        }
+
+        // Spin-then-sleep logic
+        if (now_benchmark_us() - start <= config_.consumer_busy_spin_duration_us) continue;
+
+        if (pop_result.result == shm::RingBuffer::ReadResult::TOO_FAR_AHEAD) {
+          if (read_seq >= write_seq) {
+            shm::futex_wait(&segment_->write_seq_futex, pop_result.write_seq_futex);
           }
-          case shm::RingBuffer::ReadResult::TOO_FAR_AHEAD: {
-            // Busy spin for configured duration then sleep
-            const auto now = std::chrono::steady_clock::now();
-
-            if (now - start > consumer_busy_spin_duration_) {
-              if (read_seq < segment_->write_seq.load(std::memory_order_acquire)) {
-                // Producer advanced, retry instead of sleeping
-                continue;
-              }
-
-              // TODO: handle futex errors
-              shm::futex_wait(&segment_->write_seq_futex, pop_result.write_seq_futex);
-            }
-            break;
-          }
-          case shm::RingBuffer::ReadResult::OVERWRITTEN: {
-            // Overrun occurred, move read pointer to latest message
-            const uint64_t current_read_seq = read_seq;
-            const uint64_t new_read_seq = segment_->write_seq.load(std::memory_order_acquire);
-
-            segment_->subscribers[subscriber_index_].read_seq.store(new_read_seq, std::memory_order_release);
-            // TODO: add logging/reporting for subscriber being slow and messages being dropped
-            segment_->subscribers[subscriber_index_].dropped_count.fetch_add(new_read_seq - current_read_seq);
-            break;
-          }
-          default:
-            break;
+        } else if (pop_result.result == shm::RingBuffer::ReadResult::NOT_COMMITTED_YET ||
+                   pop_result.result == shm::RingBuffer::ReadResult::EMPTY) {
+          if (read_seq < write_seq) continue;
+          auto& slot_state = segment_mapping_->header_at(read_seq)->state;
+          shm::futex_wait(&slot_state, pop_result.slot_state);
         }
       }
     });
   }
 };
 
-std::unique_ptr<Bus> createBus(const std::string &name, const Config &config) {
+std::unique_ptr<Bus> create_bus(const std::string &name, const Config &config) {
   return std::make_unique<BusImpl>(name, config);
 }
 } // namespace redline

@@ -27,11 +27,10 @@ static_assert(sizeof(SubscriberEntry) % CACHE_LINE_SIZE == 0);
 
 struct alignas(CACHE_LINE_SIZE) SlotHeader {
   std::atomic_uint32_t state = uint32_t(SlotState::EMPTY);
-  uint32_t size = 0;                // actual message size in bytes
-  uint64_t seq = 0;                 // written seq for this slot
-  int64_t publish_timestamp = 0;    // timestamp when published TODO: remove?
-  uint32_t _pad0 = 0;               // pad to 8-byte boundary if desired
-  uint64_t _pad1 = 0;               // make sizeof a multiple of 64
+  uint32_t size = 0;                   // actual message size in bytes
+  uint64_t seq = 0;                    // written seq for this slot
+  int64_t publish_timestamp_us = 0;    // real timestamp when published
+  uint8_t padding[64 - 4 - 4 - 8 - 8];
 };
 static_assert(alignof(SlotHeader) >= CACHE_LINE_SIZE);
 static_assert(sizeof(SlotHeader) % CACHE_LINE_SIZE == 0);

@@ -6,7 +6,7 @@
 
 #include "glog/logging.h"
 
-#include <sys/mman.h>
+#include "redline/utils.hpp"
 
 int main() {
   using namespace redline;
@@ -14,7 +14,7 @@ int main() {
   Config config;
   config.consumer_busy_spin_duration_us = 10;
 
-  const auto bus = createBus("testing", config);
+  const auto bus = create_bus("testing", config);
 
   auto publish_thread_1 = std::thread([bus = bus.get(), config]() {
     uint64_t counter = 0;
@@ -27,8 +27,22 @@ int main() {
     }
   });
 
-  bus->create_subscriber([](const std::span<const uint8_t>& data) {
-    LOG_EVERY_T(INFO, 1.) << "Message received (sub 1): " << std::string(data.begin(), data.end());
+  int64_t last_time_us = 0;
+  int64_t messageCount = 0;
+  double total_latency_ms = 0.0;
+
+  bus->create_subscriber([&](const Message& message) {
+    const int64_t current_time_us = now_us();
+
+    if (current_time_us - last_time_us > 1'000'000) {
+      LOG(INFO) << "Received " << messageCount << " messages in the last second, average latency: " << (messageCount > 0 ? total_latency_ms / messageCount : 0.0) << " ms";
+      last_time_us = current_time_us;
+      messageCount = 0;
+      total_latency_ms = 0.0;
+    }
+
+    total_latency_ms += double(current_time_us - message.publish_timestamp) / 1000;
+    messageCount++;
   });
 
   while (true) {

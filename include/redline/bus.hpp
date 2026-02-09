@@ -8,7 +8,13 @@
 
 namespace redline {
 
-using Subscriber = std::function<void(const std::span<const uint8_t>& data)>;
+struct Message {
+  uint64_t sequence;
+  std::span<const uint8_t> data;
+  int64_t publish_timestamp; // real timestamp, affected by NTP
+};
+
+using Subscriber = std::function<void(const Message& message)>;
 
 // TODO: enforce Bus is singleton per name
 class Bus {
@@ -21,5 +27,5 @@ public:
   virtual ~Bus() = default;
 };
 
-std::unique_ptr<Bus> createBus(const std::string& name, const Config& config);
+std::unique_ptr<Bus> create_bus(const std::string& name, const Config& config);
 }
