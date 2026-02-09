@@ -13,6 +13,7 @@ int main() {
 
   Config config;
   config.consumer_busy_spin_duration_us = 10;
+  config.backpressure_mode = BackPressureMode::RELIABLE;
 
   const auto bus = create_bus("testing", config);
 
@@ -20,10 +21,10 @@ int main() {
     uint64_t counter = 0;
     while (true) {
       std::string message = "Hello, world! " + std::to_string(counter++);
-      while (!bus->publish(std::span((const uint8_t*) message.data(), message.size()))) {
-        // busy spin
+      auto ec = bus->publish(std::span((const uint8_t*) message.data(), message.size()), -1);
+      if (ec != ErrorCode::OK) {
+        LOG(ERROR) << "Failed to publish message: " << static_cast<int>(ec);
       }
-      // std::this_thread::sleep_for(std::chrono::nanoseconds(10));
     }
   });
 
@@ -35,7 +36,8 @@ int main() {
     const int64_t current_time_us = now_us();
 
     if (current_time_us - last_time_us > 1'000'000) {
-      LOG(INFO) << "Received " << messageCount << " messages in the last second, average latency: " << (messageCount > 0 ? total_latency_ms / messageCount : 0.0) << " ms";
+      LOG(INFO) << "Message: " << message.data_as_string();
+      LOG(INFO) << "Received " << messageCount << " messages in the last second, average latency: " << (messageCount > 0 ? total_latency_ms / double(messageCount) : 0.0) << " ms";
       last_time_us = current_time_us;
       messageCount = 0;
       total_latency_ms = 0.0;

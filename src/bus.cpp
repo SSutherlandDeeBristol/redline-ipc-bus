@@ -19,24 +19,35 @@ class BusImpl : public Bus {
 public:
   BusImpl(const std::string& name, const Config& config)
       : name_(name), config_(config) {
+    if (config_.max_message_size % 64 != 0) {
+      throw std::invalid_argument("max_message_size must be a multiple of 64");
+    }
+
     segment_mapping_ = shm::SegmentMapping::open_or_create("/redline." + name, config);
     segment_ = segment_mapping_->segment();
     ring_buffer_ = std::make_unique<shm::RingBuffer>(segment_mapping_);
     subscriber_registry_ = std::make_unique<shm::SubscriberRegistry>(segment_mapping_);
   }
 
-  bool publish(const std::span<const uint8_t>& data) override {
-    const int64_t timestamp_us = now_us();
+  ErrorCode publish(const std::span<const uint8_t>& data, const int64_t timeout_us) override {
+    int64_t timestamp_us = now_us();
 
-    const uint64_t write_seq = segment_->write_seq.load(std::memory_order_acquire);
-    const uint64_t slowest_seq = compute_slowest_subscriber_read_seq();
+    if (config_.backpressure_mode == BackPressureMode::RELIABLE) {
+      uint64_t write_seq = segment_->write_seq.load(std::memory_order_acquire);
+      uint64_t slowest_seq = compute_slowest_subscriber_read_seq();
 
-    // Backpressure check: don't overwrite unread slots
-    if (write_seq - slowest_seq >= segment_->slot_count) {
-      // Handle backpressure: drop message, yield, or spin
-      // For example, drop:
-      LOG_EVERY_T(WARNING, 1.0) << "Blocking message due to backpressure " << "(write_seq: " << write_seq << ", slowest_seq: " << slowest_seq << ")";
-      return false;
+      // Backpressure check: don't overwrite unread slots
+      const int64_t start_time_us = now_benchmark_us();
+      while (write_seq - slowest_seq >= segment_->slot_count && (timeout_us < 0 || now_benchmark_us() - start_time_us < timeout_us)) {
+        // Wait for the slowest subscriber to catch up
+        write_seq = segment_->write_seq.load(std::memory_order_acquire);
+        slowest_seq = compute_slowest_subscriber_read_seq();
+      }
+
+      if (write_seq - slowest_seq >= segment_->slot_count) {
+        // Timed out waiting for backpressure to clear
+        return ErrorCode::BACKPRESSURE_TIMEOUT;
+      }
     }
 
     const auto push_result = ring_buffer_->try_push(data, timestamp_us);
@@ -46,36 +57,44 @@ public:
       // TODO: handle futex errors
       shm::futex_wake(&slot_state, std::numeric_limits<int>::max());
       shm::futex_wake(&segment_->write_seq_futex, std::numeric_limits<int>::max());
-      return true;
+      return ErrorCode::OK;
     }
 
-    return false;
+    if (push_result.result == shm::RingBuffer::WriteResult::MESSAGE_TOO_LARGE) {
+      return ErrorCode::MESSAGE_TOO_LARGE;
+    }
+
+    return ErrorCode::UNKNOWN_ERROR;
   }
 
-  void create_subscriber(const Subscriber &subscriber) override {
-    const size_t subscriber_callback_index = subscriber_callback_count_.load();
+  ErrorCode create_subscriber(const Subscriber &subscriber) override {
+    // Lock here to ensure that we don't need one "ready" atomic per subscriber callback, since the poll thread can read subscriber_callbacks_ without holding this mutex
+    std::lock_guard lk(subscriber_creation_mutex_);
+
+    const size_t subscriber_callback_index = next_subscriber_callback_count_.load();
 
     if (subscriber_callback_index >= subscriber_callbacks_.size()) {
-      throw std::runtime_error("Maximum number of subscribers exceeded for bus " + name_);
+      return ErrorCode::SUBSCRIBER_CALLBACKS_FULL;
     }
 
     subscriber_callbacks_[subscriber_callback_index] = subscriber;
-    subscriber_callback_count_.fetch_add(1);
+    next_subscriber_callback_count_.fetch_add(1, std::memory_order_release);
 
     // Return if we have already registered this instance of Bus as a subscriber, otherwise we need to register and start the poll thread
     if (subscriber_callback_index > 0) {
-      return;
+      return ErrorCode::OK;
     }
 
     const auto register_subscriber_result = subscriber_registry_->register_subscriber(subscriber_index_);
 
     if (register_subscriber_result == shm::SubscribeResult::REGISTRY_FULL) {
-      // TODO: return proper error instead of throwing...
-      throw std::runtime_error("Failed to register subscriber for bus " + name_ + ": registry full");
+      return ErrorCode::SUBSCRIBER_REGISTRY_FULL;
     }
 
     // Set up a thread to poll for new messages and call the subscriber
     init_poll_thread();
+
+    return ErrorCode::OK;
   }
 
   ~BusImpl() override {
@@ -101,8 +120,9 @@ private:
 
   uint64_t subscriber_index_ = 0;
 
-  std::array<Subscriber, 128> subscriber_callbacks_; // TODO: make this dynamic if we want more subscribers than this?
-  std::atomic_size_t subscriber_callback_count_ = 0;
+  std::array<Subscriber, 128> subscriber_callbacks_; // TODO: make this dynamic
+  std::mutex subscriber_creation_mutex_;
+  std::atomic_size_t next_subscriber_callback_count_ = 0;
 
   std::atomic_bool stop_polling_{false};
   std::thread poll_thread_;
@@ -133,13 +153,17 @@ private:
 
         if (pop_result.result == shm::RingBuffer::ReadResult::OK) {
           // Deliver message
-          const auto callback_count = subscriber_callback_count_.load(std::memory_order_acquire);
+          const auto callback_count = next_subscriber_callback_count_.load(std::memory_order_acquire);
           for (size_t i = 0; i < callback_count; ++i) {
-            subscriber_callbacks_[i](Message{
-              .sequence = read_seq,
-              .data = pop_result.data,
-              .publish_timestamp = pop_result.publish_timestamp_us
-            });
+            try {
+              subscriber_callbacks_[i](Message{
+                .sequence = read_seq,
+                .publish_timestamp = pop_result.publish_timestamp_us,
+                .data = pop_result.data
+              });
+            } catch (const std::exception& e) {
+              LOG(ERROR) << "Subscriber callback " << i << " threw exception: " << e.what();
+            }
           }
           subscriber_entry.read_seq.fetch_add(1, std::memory_order_release);
           start = now_benchmark_us();
