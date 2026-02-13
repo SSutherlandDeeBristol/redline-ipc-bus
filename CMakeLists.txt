@@ -45,6 +45,7 @@ target_include_directories(redline
 target_sources(redline
   PRIVATE
   src/bus.cpp
+  src/subscriber.cpp
   src/shm/layout.hpp
   src/shm/segment.hpp
   src/shm/segment.cpp

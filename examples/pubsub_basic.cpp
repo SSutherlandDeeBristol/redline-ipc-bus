@@ -32,7 +32,7 @@ int main() {
   int64_t messageCount = 0;
   double total_latency_ms = 0.0;
 
-  bus->create_subscriber([&](const Message& message) {
+  bus->add_subscriber([&](const Message& message) {
     const int64_t current_time_us = now_us();
 
     if (current_time_us - last_time_us > 1'000'000) {

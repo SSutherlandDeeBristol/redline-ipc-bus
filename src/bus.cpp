@@ -67,7 +67,11 @@ public:
     return ErrorCode::UNKNOWN_ERROR;
   }
 
-  ErrorCode create_subscriber(const Subscriber &subscriber) override {
+ErrorCode add_subscriber(const std::function<void(const Message&)>& callback) override {
+    return add_subscriber(create_subscriber(callback));
+  }
+
+  ErrorCode add_subscriber(std::shared_ptr<Subscriber> subscriber) override {
     // Lock here to ensure that we don't need one "ready" atomic per subscriber callback, since the poll thread can read subscriber_callbacks_ without holding this mutex
     std::lock_guard lk(subscriber_creation_mutex_);
 
@@ -77,7 +81,7 @@ public:
       return ErrorCode::SUBSCRIBER_CALLBACKS_FULL;
     }
 
-    subscriber_callbacks_[subscriber_callback_index] = subscriber;
+    subscriber_callbacks_[subscriber_callback_index] = std::move(subscriber);
     next_subscriber_callback_count_.fetch_add(1, std::memory_order_release);
 
     // Return if we have already registered this instance of Bus as a subscriber, otherwise we need to register and start the poll thread
@@ -120,7 +124,7 @@ private:
 
   uint64_t subscriber_index_ = 0;
 
-  std::array<Subscriber, 128> subscriber_callbacks_; // TODO: make this dynamic
+  std::array<std::shared_ptr<Subscriber>, 128> subscriber_callbacks_; // TODO: make this dynamicly sized
   std::mutex subscriber_creation_mutex_;
   std::atomic_size_t next_subscriber_callback_count_ = 0;
 
@@ -156,7 +160,7 @@ private:
           const auto callback_count = next_subscriber_callback_count_.load(std::memory_order_acquire);
           for (size_t i = 0; i < callback_count; ++i) {
             try {
-              subscriber_callbacks_[i](Message{
+              subscriber_callbacks_[i]->consume(Message{
                 .sequence = read_seq,
                 .publish_timestamp = pop_result.publish_timestamp_us,
                 .data = pop_result.data
