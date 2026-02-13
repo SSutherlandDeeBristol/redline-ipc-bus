@@ -20,12 +20,12 @@ public:
   };
 
   PushResult try_push(const std::span<const uint8_t> & data,
-                      int64_t timestamp_us);
+                      int64_t timestamp_ns);
 
   struct PopResult {
     ReadResult result;
     std::span<const uint8_t> data;
-    int64_t publish_timestamp_us;
+    int64_t publish_timestamp_ns;
     uint32_t slot_state;
     uint32_t write_seq_futex;
   };

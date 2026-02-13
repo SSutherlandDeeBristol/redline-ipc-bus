@@ -13,7 +13,8 @@ int main() {
 
   Config config;
   config.consumer_busy_spin_duration_us = 10;
-  config.backpressure_mode = BackPressureMode::RELIABLE;
+  config.backpressure_mode = BackPressureMode::BEST_EFFORT;
+  config.latency_sliding_window_size = 8192;
 
   const auto bus = create_bus("testing", config);
 
@@ -28,27 +29,37 @@ int main() {
     }
   });
 
-  int64_t last_time_us = 0;
+  int64_t last_time_ns = 0;
   int64_t messageCount = 0;
-  double total_latency_ms = 0.0;
+  double total_latency_ns = 0.0;
 
   bus->add_subscriber([&](const Message& message) {
-    const int64_t current_time_us = now_us();
+    const int64_t current_time_ns = now_ns();
 
-    if (current_time_us - last_time_us > 1'000'000) {
+    if (current_time_ns - last_time_ns > 1'000'000'000) {
       LOG(INFO) << "Message: " << message.data_as_string();
-      LOG(INFO) << "Received " << messageCount << " messages in the last second, average latency: " << (messageCount > 0 ? total_latency_ms / double(messageCount) : 0.0) << " ms";
-      last_time_us = current_time_us;
+      LOG(INFO) << "Received " << messageCount << " messages in the last second, average latency: " << (messageCount > 0 ? (total_latency_ns) / double(messageCount) : 0.0) << " ns";
+      last_time_ns = current_time_ns;
       messageCount = 0;
-      total_latency_ms = 0.0;
+      total_latency_ns = 0.0;
     }
 
-    total_latency_ms += double(current_time_us - message.publish_timestamp) / 1000;
+    total_latency_ns += double(current_time_ns - message.publish_timestamp_ns);
     messageCount++;
   });
 
   while (true) {
-    std::this_thread::sleep_for(std::chrono::seconds(60));
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    const auto metrics = bus->get_subscriber_metrics();
+    LOG(INFO) << "Subscriber metrics:\nmessages_consumed=" << metrics.messages_consumed
+              << "\ndropped_messages=" << metrics.dropped_messages
+              << "\ncurrent_lag=" << metrics.current_lag
+              << "\nmax_lag=" << metrics.max_lag
+              << "\nlast_latency_ns=" << metrics.last_latency_ns
+              << "\np50_latency_ns=" << metrics.p50_latency_ns
+              << "\np90_latency_ns=" << metrics.p90_latency_ns
+              << "\np99_latency_ns=" << metrics.p99_latency_ns
+              << "\np999_latency_ns=" << metrics.p999_latency_ns;
   }
 
   return 0;

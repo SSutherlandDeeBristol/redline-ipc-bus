@@ -15,13 +15,15 @@ enum class SegmentInitState : uint32_t { UNINITIALISED, INITIALISING, INITIALISE
 enum class SubscriberState : uint32_t { EMPTY, INITIALISING, OK, DEAD };
 enum class SlotState : uint32_t { EMPTY, WRITING, COMMITTED };
 
-// TODO: make cache line size
 struct alignas(CACHE_LINE_SIZE) SubscriberEntry {
   std::atomic_uint32_t state = uint32_t(SlotState::EMPTY);
   uint64_t pid; // Process ID
   std::atomic_uint64_t read_seq = 0;
   int64_t last_read_timestamp = 0;
   alignas(CACHE_LINE_SIZE) std::atomic_uint64_t dropped_count = 0;
+  std::atomic_uint64_t messages_consumed = 0;
+  std::atomic_uint64_t max_lag = 0;
+  std::atomic_int64_t last_latency_ns = 0;
 };
 static_assert(sizeof(SubscriberEntry) % CACHE_LINE_SIZE == 0);
 
@@ -29,7 +31,7 @@ struct alignas(CACHE_LINE_SIZE) SlotHeader {
   std::atomic_uint32_t state = uint32_t(SlotState::EMPTY);
   uint32_t size = 0;                   // actual message size in bytes
   uint64_t seq = 0;                    // written seq for this slot
-  int64_t publish_timestamp_us = 0;    // real timestamp when published
+  int64_t publish_timestamp_ns = 0;    // real timestamp when published
   uint8_t padding[64 - 4 - 4 - 8 - 8];
 };
 static_assert(alignof(SlotHeader) >= CACHE_LINE_SIZE);

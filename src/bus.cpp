@@ -27,10 +27,13 @@ public:
     segment_ = segment_mapping_->segment();
     ring_buffer_ = std::make_unique<shm::RingBuffer>(segment_mapping_);
     subscriber_registry_ = std::make_unique<shm::SubscriberRegistry>(segment_mapping_);
+
+    latency_window_size_ = config.latency_sliding_window_size > 0 ? config.latency_sliding_window_size : latency_window_size_;
+    latency_samples_.resize(latency_window_size_, 0);
   }
 
   ErrorCode publish(const std::span<const uint8_t>& data, const int64_t timeout_us) override {
-    int64_t timestamp_us = now_us();
+    int64_t timestamp_ns = now_ns();
 
     if (config_.backpressure_mode == BackPressureMode::RELIABLE) {
       uint64_t write_seq = segment_->write_seq.load(std::memory_order_acquire);
@@ -50,7 +53,7 @@ public:
       }
     }
 
-    const auto push_result = ring_buffer_->try_push(data, timestamp_us);
+    const auto push_result = ring_buffer_->try_push(data, timestamp_ns);
     if (push_result.result == shm::RingBuffer::WriteResult::OK) {
       std::atomic_uint32_t &slot_state = segment_mapping_->header_at(push_result.write_seq)->state;
       // Wake up all subscribers waiting on this slot
@@ -101,6 +104,49 @@ ErrorCode add_subscriber(const std::function<void(const Message&)>& callback) ov
     return ErrorCode::OK;
   }
 
+  SubscriberMetricsSnapshot get_subscriber_metrics() const override {
+    SubscriberMetricsSnapshot snap;
+
+    const auto &entry = segment_->subscribers[subscriber_index_];
+
+    const uint64_t read_seq =
+        entry.read_seq.load(std::memory_order_relaxed);
+    const uint64_t write_seq =
+        segment_->write_seq.load(std::memory_order_relaxed);
+
+    snap.messages_consumed =
+        entry.messages_consumed.load(std::memory_order_relaxed);
+    snap.dropped_messages =
+        entry.dropped_count.load(std::memory_order_relaxed);
+    snap.current_lag = write_seq - read_seq;
+    snap.max_lag =
+        entry.max_lag.load(std::memory_order_relaxed);
+    snap.last_latency_ns = entry.last_latency_ns.load(std::memory_order_relaxed);
+
+    // Sliding window reservoir percentiles
+    size_t count = std::min(latency_index_, latency_window_size_);
+    if (count > 0) {
+      std::vector<uint64_t> copy(count);
+      for (size_t i = 0; i < count; ++i) {
+        copy[i] = latency_samples_[i];
+      }
+
+      auto compute_percentile = [&](double p) -> uint64_t {
+        size_t idx = static_cast<size_t>(p * count);
+        if (idx >= count) idx = count - 1;
+        std::nth_element(copy.begin(), copy.begin() + idx, copy.end());
+        return copy[idx];
+      };
+
+      snap.p50_latency_ns = compute_percentile(0.50);
+      snap.p90_latency_ns = compute_percentile(0.90);
+      snap.p99_latency_ns = compute_percentile(0.99);
+      snap.p999_latency_ns = compute_percentile(0.999);
+    }
+
+    return snap;
+  }
+
   ~BusImpl() override {
     // Stop the poll thread if running
     stop_polling_ = true;
@@ -127,6 +173,10 @@ private:
   std::array<std::shared_ptr<Subscriber>, 128> subscriber_callbacks_; // TODO: make this dynamicly sized
   std::mutex subscriber_creation_mutex_;
   std::atomic_size_t next_subscriber_callback_count_ = 0;
+
+  std::vector<int64_t> latency_samples_{};
+  size_t latency_index_ = 0; // only written by poll thread
+  size_t latency_window_size_ = 2048;
 
   std::atomic_bool stop_polling_{false};
   std::thread poll_thread_;
@@ -156,19 +206,45 @@ private:
         auto pop_result = ring_buffer_->try_pop(read_seq);
 
         if (pop_result.result == shm::RingBuffer::ReadResult::OK) {
-          // Deliver message
+          const uint64_t write_seq = segment_->write_seq.load(std::memory_order_relaxed);
+
+          const uint64_t lag = write_seq - read_seq;
+
+          subscriber_entry.messages_consumed.fetch_add(1, std::memory_order_relaxed);
+
+          // Update max lag
+          uint64_t prev_max = subscriber_entry.max_lag.load(std::memory_order_relaxed);
+          while (lag > prev_max &&
+                 !subscriber_entry.max_lag.compare_exchange_weak(
+                     prev_max, lag, std::memory_order_relaxed)) {}
+
+          // Record latency
+          const int64_t now = now_ns();
+          const int64_t latency_ns = now - pop_result.publish_timestamp_ns;
+
+          subscriber_entry.last_latency_ns.store(latency_ns, std::memory_order_relaxed);
+
+          // Sliding window reservoir (lock-free because single writer)
+          latency_samples_[latency_index_ & (latency_window_size_ - 1)] = latency_ns;
+          latency_index_++;
+
+          // Deliver message to all registered callbacks
+          Message message{
+            .sequence = read_seq,
+            .publish_timestamp_ns = pop_result.publish_timestamp_ns,
+            .data = pop_result.data
+          };
+
           const auto callback_count = next_subscriber_callback_count_.load(std::memory_order_acquire);
           for (size_t i = 0; i < callback_count; ++i) {
             try {
-              subscriber_callbacks_[i]->consume(Message{
-                .sequence = read_seq,
-                .publish_timestamp = pop_result.publish_timestamp_us,
-                .data = pop_result.data
-              });
+              subscriber_callbacks_[i]->consume(message);
             } catch (const std::exception& e) {
               LOG(ERROR) << "Subscriber callback " << i << " threw exception: " << e.what();
             }
           }
+
+          // Update subscriber position
           subscriber_entry.read_seq.fetch_add(1, std::memory_order_release);
           start = now_benchmark_us();
           subscriber_entry.last_read_timestamp = start;

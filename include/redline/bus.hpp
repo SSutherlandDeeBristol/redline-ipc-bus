@@ -9,6 +9,20 @@
 #include "redline/config.hpp"
 
 namespace redline {
+struct SubscriberMetricsSnapshot {
+  uint64_t messages_consumed = 0;
+  uint64_t dropped_messages = 0;
+  uint64_t current_lag = 0;
+  uint64_t max_lag = 0;
+  int64_t last_latency_ns = 0;
+
+  // Percentiles
+  int64_t p50_latency_ns = 0;
+  int64_t p90_latency_ns = 0;
+  int64_t p99_latency_ns = 0;
+  int64_t p999_latency_ns = 0;
+};
+
 class Bus {
 public:
   // timeout_us = -1 means no timeout (i.e. block indefinitely until message is published successfully)
@@ -22,6 +36,8 @@ public:
   // create_subscriber is thread-safe but may wait on a mutex if another thread is currently creating a subscriber.
   virtual ErrorCode add_subscriber(const std::function<void(const Message&)>& callback) = 0;
   virtual ErrorCode add_subscriber(std::shared_ptr<Subscriber> subscriber) = 0;
+
+  virtual SubscriberMetricsSnapshot get_subscriber_metrics() const = 0;
 
   virtual ~Bus() = default;
 };

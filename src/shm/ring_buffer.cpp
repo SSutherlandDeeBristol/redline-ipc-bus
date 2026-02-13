@@ -11,7 +11,7 @@ RingBuffer::RingBuffer(std::shared_ptr<SegmentMapping> segment)
     : segment_(std::move(segment)), shm_segment_(segment_->segment()) {}
 
 RingBuffer::PushResult RingBuffer::try_push(const std::span<const uint8_t> &data,
-                                            const int64_t timestamp_us) {
+                                            const int64_t timestamp_ns) {
   PushResult push_result{};
 
   if (data.size() > shm_segment_->slot_size_bytes) {
@@ -26,7 +26,7 @@ RingBuffer::PushResult RingBuffer::try_push(const std::span<const uint8_t> &data
   header->state.store(uint32_t(SlotState::WRITING));
   header->seq = seq;
   header->size = uint32_t(data.size());
-  header->publish_timestamp_us = timestamp_us;
+  header->publish_timestamp_ns = timestamp_ns;
 
   uint8_t *payload = segment_->payload_at(seq);
   memcpy(payload, data.data(), data.size());
@@ -68,7 +68,7 @@ RingBuffer::PopResult RingBuffer::try_pop(const uint64_t &seq) {
   }
 
   pop_result.data = std::span(segment_->payload_at(seq), header->size);
-  pop_result.publish_timestamp_us = header->publish_timestamp_us;
+  pop_result.publish_timestamp_ns = header->publish_timestamp_ns;
   pop_result.result = ReadResult::OK;
 
   return pop_result;

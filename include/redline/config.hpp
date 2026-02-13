@@ -10,7 +10,11 @@ enum class BackPressureMode {
 struct Config {
   uint32_t max_message_size              = 4096; // in bytes (must be multiple of 64)
   uint32_t max_messages                  = 1024; // total number of messages in the bus
-  int64_t consumer_busy_spin_duration_us = 100; // how long to busy spin for when waiting for messages before sleeping, in microseconds
+
   BackPressureMode backpressure_mode     = BackPressureMode::RELIABLE;
+
+  int64_t consumer_busy_spin_duration_us = 100; // how long to busy spin for when waiting for messages before sleeping, in microseconds
+
+  size_t latency_sliding_window_size    = 4096; // number of latency samples to keep for percentile calculations
 };
 }
