@@ -12,9 +12,9 @@ int main() {
   using namespace redline;
 
   Config config;
+  config.bus_size = 8192;
   config.consumer_busy_spin_duration_us = 10;
   config.backpressure_mode = BackPressureMode::BEST_EFFORT;
-  config.latency_sliding_window_size = 8192;
 
   const auto bus = create_bus("testing", config);
 

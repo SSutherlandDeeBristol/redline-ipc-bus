@@ -34,8 +34,8 @@ SegmentMapping::SegmentMapping(const std::string &name, const Config& config) {
   name_ = name;
 
   const uint64_t slot_headers_offset = align_up(sizeof(SHMSegment), 64);
-  const uint64_t slot_data_offset    = align_up(slot_headers_offset + config.max_messages * sizeof(SlotHeader), 64);
-  const uint64_t total_bytes         = slot_data_offset + (config.max_messages * config.max_message_size);
+  const uint64_t slot_data_offset    = align_up(slot_headers_offset + config.bus_size * sizeof(SlotHeader), 64);
+  const uint64_t total_bytes         = slot_data_offset + (config.bus_size * config.max_message_size);
 
   // Attempt to open the shared memory file, creating it if it doesn't exist
   shm_fd_ = shm_open(name_.c_str(), O_RDWR | O_CREAT | O_EXCL, 0666); // TODO: check file mode
@@ -61,7 +61,7 @@ SegmentMapping::SegmentMapping(const std::string &name, const Config& config) {
     // Initialise the rest of the segment
     segment_->magic = MAGIC;
     segment_->version = VERSION;
-    segment_->slot_count = config.max_messages;
+    segment_->slot_count = config.bus_size;
     segment_->slot_size_bytes = config.max_message_size;
     segment_->slot_headers_offset = slot_headers_offset;
     segment_->slot_data_offset = slot_data_offset;
@@ -135,12 +135,12 @@ SegmentMapping::SegmentMapping(const std::string &name, const Config& config) {
                                std::to_string(actual_slot_size) + ")");
     }
 
-    if (actual_slot_count != config.max_messages) {
+    if (actual_slot_count != config.bus_size) {
       munmap(base_, sizeof(SHMSegment));
       close(shm_fd_);
 
       throw std::runtime_error("Shared memory segment slot count mismatch at " + name_ + " (expected " +
-                               std::to_string(config.max_messages) + ", got " +
+                               std::to_string(config.bus_size) + ", got " +
                                std::to_string(actual_slot_count) + ")");
     }
 
