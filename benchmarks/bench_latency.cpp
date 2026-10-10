@@ -17,19 +17,19 @@ void BM_PingPong(benchmark::State& state) {
   const bool zero_copy = state.range(1) != 0;
 
   bench::ScopedBus ping_name("ping"), pong_name("pong");
-  Config config;
-  config.bus_size = 1024;
-  config.max_message_size = 4096;
-  config.backpressure_mode = BackPressureMode::RELIABLE;
-  config.zero_copy_reads = zero_copy;
-  config.consumer_busy_spin_duration_us = 1'000'000; // spin, don't sleep: measure the transport, not futex wakeups
+  BusLayout layout;
+  layout.bus_size = 1024;
+  layout.max_message_size = 4096;
+  BusOptions options;
+  options.zero_copy_reads = zero_copy;
+  options.consumer_busy_spin_duration_us = 1'000'000; // spin, don't sleep: measure the transport, not futex wakeups
 
-  auto ping = create_bus(ping_name.name(), config);
-  auto pong = create_bus(pong_name.name(), config);
+  auto ping = bench::make_bus(ping_name.name(), layout, options);
+  auto pong = bench::make_bus(pong_name.name(), layout, options);
 
-  // The echo side would normally live in another process
-  auto echo_in = create_bus(ping_name.name(), config);
-  auto echo_out = create_bus(pong_name.name(), config);
+  // The echo side would normally live in another process: see bench_ipc for that
+  auto echo_in = bench::make_bus(ping_name.name(), layout, options);
+  auto echo_out = bench::make_bus(pong_name.name(), layout, options);
   echo_in->add_subscriber([&](const Message& m) { echo_out->publish(m.data); });
 
   std::atomic_uint64_t pongs{0};

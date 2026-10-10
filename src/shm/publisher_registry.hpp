@@ -8,6 +8,10 @@
 #include "segment.hpp"
 
 namespace redline::shm {
+// How long a reserved sequence can stay unfinished before a waiting subscriber or publisher checks whether its
+// publisher has died. Recovery never touches a live publisher's sequence, so this only bounds how often we look.
+constexpr int64_t STALL_RECOVERY_NS = 1'000'000;
+
 
 // Ownership of one publisher registry entry, held as an OFD lock (see lease.hpp). A lease may have at most one
 // reservation outstanding at a time. Destroying the lease deregisters the entry.
@@ -48,9 +52,9 @@ class PublisherRegistry {
 public:
   explicit PublisherRegistry(std::shared_ptr<SegmentMapping> segment);
 
-  // Claims an entry, recovering entries left by dead publishers if the registry is full. Returns nullptr if it is
-  // still full; throws std::runtime_error if the lease's file description can't be opened.
-  std::unique_ptr<PublisherLease> register_publisher();
+  // Claims an entry, recovering entries left by dead publishers if the registry is full. Fails with
+  // PUBLISHER_REGISTRY_FULL if it is still full, and SYSTEM_ERROR if the lease's file description can't be opened.
+  Result<std::unique_ptr<PublisherLease>> register_publisher();
 
   // Finishes, as lost, every sequence that a dead publisher reserved but never committed, so that subscribers and
   // later publishers can get past it, and frees the dead publishers' entries. A sequence is only ever finished when no

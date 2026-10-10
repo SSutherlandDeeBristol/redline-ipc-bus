@@ -29,12 +29,12 @@ std::vector<std::vector<uint8_t>> drain(Subscription& subscription) {
 
 TEST(Claim, CommitPublishesWhatWasWrittenInPlace) {
   ScopedBusName name;
-  auto bus = create_bus(name, test_config(BackPressureMode::RELIABLE, 8, 128));
-  auto subscription = bus->subscribe();
+  auto bus = make_bus(name, test_config(BackPressureMode::RELIABLE, 8, 128));
+  auto subscription = subscribe(*bus);
 
   Claim claim;
   EXPECT_FALSE(claim);
-  ASSERT_EQ(bus->claim(claim), ErrorCode::OK);
+  ASSERT_TRUE(claim_into(*bus, claim));
   ASSERT_TRUE(claim);
   EXPECT_EQ(claim.data().size(), 128u);
   EXPECT_EQ(claim.sequence(), 0u);
@@ -42,10 +42,10 @@ TEST(Claim, CommitPublishesWhatWasWrittenInPlace) {
   size_t size = 0;
   write_payload(claim, 1, 42, 100, size);
   const int64_t before_commit = now_ns();
-  EXPECT_EQ(claim.commit(size), ErrorCode::OK);
+  EXPECT_TRUE(claim.commit(size));
   EXPECT_FALSE(claim);
   EXPECT_TRUE(claim.data().empty());
-  EXPECT_EQ(claim.commit(size), ErrorCode::INVALID_ARGUMENT) << "already committed";
+  EXPECT_EQ(claim.commit(size), std::unexpected(Error::INVALID_ARGUMENT)) << "already committed";
 
   std::vector<uint8_t> payload;
   subscription->poll([&](const Message& m) {
@@ -58,37 +58,37 @@ TEST(Claim, CommitPublishesWhatWasWrittenInPlace) {
 
 TEST(Claim, CommittingTooMuchLeavesTheClaimOpen) {
   ScopedBusName name;
-  auto bus = create_bus(name, test_config(BackPressureMode::RELIABLE, 8, 64));
-  auto subscription = bus->subscribe();
+  auto bus = make_bus(name, test_config(BackPressureMode::RELIABLE, 8, 64));
+  auto subscription = subscribe(*bus);
   Claim claim;
-  ASSERT_EQ(bus->claim(claim), ErrorCode::OK);
-  EXPECT_EQ(claim.commit(65), ErrorCode::MESSAGE_TOO_LARGE);
+  ASSERT_TRUE(claim_into(*bus, claim));
+  EXPECT_EQ(claim.commit(65), std::unexpected(Error::MESSAGE_TOO_LARGE));
   ASSERT_TRUE(claim);
   std::memcpy(claim.data().data(), "ok", 2);
-  EXPECT_EQ(claim.commit(2), ErrorCode::OK);
+  EXPECT_TRUE(claim.commit(2));
   EXPECT_EQ(drain(*subscription), (std::vector<std::vector<uint8_t>>{{'o', 'k'}}));
 }
 
 TEST(Claim, AbortedClaimsAreSkippedWithoutCountingAsDropped) {
   ScopedBusName name;
-  auto bus = create_bus(name, test_config(BackPressureMode::RELIABLE, 8, 64));
-  auto subscription = bus->subscribe();
+  auto bus = make_bus(name, test_config(BackPressureMode::RELIABLE, 8, 64));
+  auto subscription = subscribe(*bus);
 
   {
     Claim explicit_abort;
-    ASSERT_EQ(bus->claim(explicit_abort), ErrorCode::OK);
+    ASSERT_TRUE(claim_into(*bus, explicit_abort));
     explicit_abort.abort();
     EXPECT_FALSE(explicit_abort);
     explicit_abort.abort(); // harmless
 
     Claim abandoned;
-    ASSERT_EQ(bus->claim(abandoned), ErrorCode::OK);
+    ASSERT_TRUE(claim_into(*bus, abandoned));
     // Reusing a claim aborts the one it held
-    ASSERT_EQ(bus->claim(abandoned), ErrorCode::OK);
+    ASSERT_TRUE(claim_into(*bus, abandoned));
     EXPECT_EQ(abandoned.sequence(), 2u);
   } // ...and destroying it aborts too
 
-  ASSERT_EQ(bus->publish(as_bytes("real")), ErrorCode::OK);
+  ASSERT_TRUE(bus->publish(as_bytes("real")));
   std::vector<uint64_t> sequences;
   subscription->poll([&](const Message& m) { sequences.push_back(m.sequence); });
   EXPECT_EQ(sequences, (std::vector<uint64_t>{3}));
@@ -98,17 +98,17 @@ TEST(Claim, AbortedClaimsAreSkippedWithoutCountingAsDropped) {
 
 TEST(Claim, OpenClaimHoldsBackLaterMessagesUntilFinished) {
   ScopedBusName name;
-  auto bus = create_bus(name, test_config(BackPressureMode::RELIABLE, 8, 64));
-  auto subscription = bus->subscribe();
+  auto bus = make_bus(name, test_config(BackPressureMode::RELIABLE, 8, 64));
+  auto subscription = subscribe(*bus);
 
   Claim claim;
-  ASSERT_EQ(bus->claim(claim), ErrorCode::OK);
-  ASSERT_EQ(bus->publish(as_bytes("second")), ErrorCode::OK);
+  ASSERT_TRUE(claim_into(*bus, claim));
+  ASSERT_TRUE(bus->publish(as_bytes("second")));
   EXPECT_TRUE(drain(*subscription).empty()) << "messages stay in order, so 'second' waits for the claim";
   EXPECT_FALSE(subscription->wait(1ms));
 
   std::memcpy(claim.data().data(), "first", 5);
-  ASSERT_EQ(claim.commit(5), ErrorCode::OK);
+  ASSERT_TRUE(claim.commit(5));
   const auto messages = drain(*subscription);
   ASSERT_EQ(messages.size(), 2u);
   EXPECT_EQ(std::string(messages[0].begin(), messages[0].end()), "first");
@@ -119,16 +119,16 @@ TEST(Claim, SleepingSubscriberIsWokenByCommitAndAbort) {
   ScopedBusName name;
   Config config = test_config(BackPressureMode::RELIABLE, 8, 64);
   config.consumer_busy_spin_duration_us = 0;
-  auto bus = create_bus(name, config);
-  auto subscription = bus->subscribe();
+  auto bus = make_bus(name, config);
+  auto subscription = subscribe(*bus);
 
   for (const bool commit : {true, false}) {
     Claim claim;
-    ASSERT_EQ(bus->claim(claim), ErrorCode::OK);
+    ASSERT_TRUE(claim_into(*bus, claim));
     std::thread finisher([&] {
       std::this_thread::sleep_for(20ms);
       if (commit) {
-        EXPECT_EQ(claim.commit(0), ErrorCode::OK);
+        EXPECT_TRUE(claim.commit(0));
       } else {
         claim.abort();
       }
@@ -142,30 +142,30 @@ TEST(Claim, SleepingSubscriberIsWokenByCommitAndAbort) {
     drain(*subscription);
   }
   // The aborted sequence doesn't block the next message
-  ASSERT_EQ(bus->publish(as_bytes("after")), ErrorCode::OK);
+  ASSERT_TRUE(bus->publish(as_bytes("after")));
   EXPECT_EQ(drain(*subscription).size(), 1u);
 }
 
 TEST(Claim, MovingTransfersTheClaim) {
   ScopedBusName name;
-  auto bus = create_bus(name, test_config(BackPressureMode::RELIABLE, 8, 64));
-  auto subscription = bus->subscribe();
+  auto bus = make_bus(name, test_config(BackPressureMode::RELIABLE, 8, 64));
+  auto subscription = subscribe(*bus);
 
   Claim original;
-  ASSERT_EQ(bus->claim(original), ErrorCode::OK);
+  ASSERT_TRUE(claim_into(*bus, original));
   Claim moved(std::move(original));
   EXPECT_FALSE(original);
   ASSERT_TRUE(moved);
 
   Claim assigned;
-  ASSERT_EQ(bus->claim(assigned), ErrorCode::OK); // sequence 1, aborted by the assignment below
+  ASSERT_TRUE(claim_into(*bus, assigned)); // sequence 1, aborted by the assignment below
   assigned = std::move(moved);
   ASSERT_TRUE(assigned);
   EXPECT_EQ(assigned.sequence(), 0u);
 
   std::thread([&] {
     std::memcpy(assigned.data().data(), "moved", 5);
-    EXPECT_EQ(assigned.commit(5), ErrorCode::OK);
+    EXPECT_TRUE(assigned.commit(5));
   }).join();
 
   std::vector<uint64_t> sequences;
@@ -175,15 +175,15 @@ TEST(Claim, MovingTransfersTheClaim) {
 
 TEST(Claim, WaitsForReliableSubscribers) {
   ScopedBusName name;
-  auto bus = create_bus(name, test_config(BackPressureMode::RELIABLE, 4, 64));
-  auto subscription = bus->subscribe();
-  for (int i = 0; i < 4; ++i) ASSERT_EQ(bus->publish(as_bytes("m"), 0), ErrorCode::OK);
+  auto bus = make_bus(name, test_config(BackPressureMode::RELIABLE, 4, 64));
+  auto subscription = subscribe(*bus);
+  for (int i = 0; i < 4; ++i) ASSERT_TRUE(bus->publish(as_bytes("m"), 0));
 
   Claim claim;
-  EXPECT_EQ(bus->claim(claim, 0), ErrorCode::BACKPRESSURE_TIMEOUT);
+  EXPECT_EQ(claim_into(*bus, claim, 0), std::unexpected(Error::BACKPRESSURE_TIMEOUT));
   EXPECT_FALSE(claim);
   EXPECT_EQ(subscription->poll([](const Message&) {}, 1), 1u);
-  EXPECT_EQ(bus->claim(claim, 0), ErrorCode::OK);
+  EXPECT_TRUE(claim_into(*bus, claim, 0));
 }
 
 // Producers build messages in place while one subscriber copies and another reads in place: everything arrives
@@ -207,23 +207,23 @@ TEST(Claim, ManyProducersEndToEndZeroCopy) {
   };
 
   Config config = test_config(BackPressureMode::RELIABLE, 32, 512);
-  auto bus = create_bus(name, config);
-  ASSERT_EQ(bus->add_subscriber(checker(copied_next, copied), {.own_thread = true}), ErrorCode::OK);
-  ASSERT_EQ(bus->add_subscriber(checker(in_place_next, in_place), {.own_thread = true, .zero_copy_reads = true}), ErrorCode::OK);
+  auto bus = make_bus(name, config);
+  ASSERT_TRUE(bus->add_subscriber(checker(copied_next, copied), {.own_thread = true}));
+  ASSERT_TRUE(bus->add_subscriber(checker(in_place_next, in_place), {.own_thread = true, .zero_copy_reads = true}));
 
   std::vector<std::thread> threads;
   for (uint32_t p = 0; p < producers; ++p) {
     threads.emplace_back([&, p] {
       Claim claim;
       for (uint64_t i = 0; i < per_producer; ++i) {
-        ASSERT_EQ(bus->claim(claim, 5'000'000), ErrorCode::OK);
+        ASSERT_TRUE(claim_into(*bus, claim, 5'000'000));
         if (i % 50 == 0) {
           claim.abort(); // gaps must be invisible to subscribers
-          ASSERT_EQ(bus->claim(claim, 5'000'000), ErrorCode::OK);
+          ASSERT_TRUE(claim_into(*bus, claim, 5'000'000));
         }
         size_t size = 0;
         write_payload(claim, p, i, 16 + uint32_t(i % 400), size);
-        ASSERT_EQ(claim.commit(size), ErrorCode::OK);
+        ASSERT_TRUE(claim.commit(size));
       }
     });
   }

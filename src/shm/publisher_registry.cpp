@@ -40,8 +40,11 @@ void PublisherLease::abandon() noexcept {
 PublisherRegistry::PublisherRegistry(std::shared_ptr<SegmentMapping> segment)
     : segment_(std::move(segment)), shm_segment_(segment_->segment()), ring_buffer_(segment_) {}
 
-std::unique_ptr<PublisherLease> PublisherRegistry::register_publisher() {
+Result<std::unique_ptr<PublisherLease>> PublisherRegistry::register_publisher() {
   const int fd = open_lease_description(*segment_);
+  if (fd < 0) {
+    return std::unexpected(Error::SYSTEM_ERROR);
+  }
 
   auto index = try_claim(fd);
   if (!index) {
@@ -50,7 +53,7 @@ std::unique_ptr<PublisherLease> PublisherRegistry::register_publisher() {
   }
   if (!index) {
     close(fd);
-    return nullptr;
+    return std::unexpected(Error::PUBLISHER_REGISTRY_FULL);
   }
 
   auto lease = std::unique_ptr<PublisherLease>(new PublisherLease(segment_, *index, fd));

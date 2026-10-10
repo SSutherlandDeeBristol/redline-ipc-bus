@@ -1,4 +1,5 @@
 #include <chrono>
+#include <mutex>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -7,6 +8,7 @@
 #include <gtest/gtest.h>
 
 #include "redline/bus.hpp"
+#include "redline/logging.hpp"
 #include "shm/layout.hpp"
 #include "shm/segment.hpp"
 #include "test_helpers.hpp"
@@ -17,25 +19,40 @@ using namespace redline::test;
 namespace {
 std::string seg(const ScopedBusName& name) { return "/redline." + name.str(); }
 
+bool valid(const Config& config) {
+  return shm::SegmentMapping::validate(config.layout()) && shm::SegmentMapping::validate(config.options());
+}
+
 void expect_invalid(const std::function<void(Config&)>& mutate) {
   Config config = test_config();
   mutate(config);
-  EXPECT_THROW(shm::SegmentMapping::validate_config(config), std::invalid_argument);
+  EXPECT_FALSE(valid(config));
 }
 
+Result<std::unique_ptr<Bus>> try_create(const std::string& name, const Config& config) {
+  return create_bus(name, config.layout(), config.options());
+}
+
+// Runs f, returning everything it logged at ERROR
 template <typename F>
-std::string error_message(F&& f) {
-  try {
-    f();
-  } catch (const std::exception& e) {
-    return e.what();
-  }
-  return "";
+std::string logged_errors(F&& f) {
+  std::mutex mutex;
+  std::string errors;
+  set_log_handler([&](LogLevel level, std::string_view message) {
+    if (level == LogLevel::ERROR) {
+      std::lock_guard lk(mutex);
+      errors.append(message).append("\n");
+    }
+  });
+  f();
+  set_log_handler(default_log_handler);
+  return errors;
 }
 }
 
 TEST(Segment, ValidatesConfig) {
-  EXPECT_NO_THROW(shm::SegmentMapping::validate_config(test_config()));
+  set_log_handler({});
+  EXPECT_TRUE(valid(test_config()));
   expect_invalid([](Config& c) { c.bus_size = 0; });
   expect_invalid([](Config& c) { c.bus_size = 1; });
   expect_invalid([](Config& c) { c.bus_size = 3; });
@@ -51,30 +68,41 @@ TEST(Segment, ValidatesConfig) {
   expect_invalid([](Config& c) { c.backpressure_mode = static_cast<BackPressureMode>(7); });
   expect_invalid([](Config& c) { c.max_subscribers = 0; });
   expect_invalid([](Config& c) { c.max_subscribers = (1u << 16) + 1; });
+  expect_invalid([](Config& c) { c.max_publishers = 0; });
+  expect_invalid([](Config& c) { c.on_lapped = static_cast<OnLapped>(7); });
+  expect_invalid([](Config& c) { c.backpressure_mode = BackPressureMode::BEST_EFFORT; c.zero_copy_reads = true; });
+  expect_invalid([](Config& c) { c.poll_thread_cpu = -1; });
+  set_log_handler(default_log_handler);
 }
 
 TEST(Segment, CreateBusRejectsInvalidConfigAndNames) {
   ScopedBusName name;
   Config config = test_config();
   config.bus_size = 100;
-  EXPECT_THROW(create_bus(name, config), std::invalid_argument);
-  EXPECT_THROW(create_bus("", test_config()), std::invalid_argument);
-  EXPECT_THROW(create_bus("a/b", test_config()), std::invalid_argument);
+  EXPECT_NE(logged_errors([&] { EXPECT_EQ(try_create(name, config), std::unexpected(Error::INVALID_ARGUMENT)); })
+                .find("bus_size must be a power of two"), std::string::npos);
+  EXPECT_NE(logged_errors([&] { EXPECT_EQ(try_create("", test_config()), std::unexpected(Error::INVALID_ARGUMENT)); })
+                .find("Bus name"), std::string::npos);
+  set_log_handler({});
+  EXPECT_EQ(try_create("a/b", test_config()), std::unexpected(Error::INVALID_ARGUMENT));
+  EXPECT_EQ(open_bus("a/b"), std::unexpected(Error::INVALID_ARGUMENT));
+  EXPECT_EQ(destroy_bus("a/b"), std::unexpected(Error::INVALID_ARGUMENT));
+  set_log_handler(default_log_handler);
   // Nothing should have been left behind by the failed attempt
   EXPECT_EQ(access(name.shm_path().c_str(), F_OK), -1);
 }
 
 TEST(Segment, MessageSizeNeedNotBeMultipleOf64) {
   ScopedBusName name;
-  auto bus = create_bus(name, test_config(BackPressureMode::RELIABLE, 64, 100));
-  EXPECT_EQ(bus->publish(std::vector<uint8_t>(100, 1)), ErrorCode::OK);
-  EXPECT_EQ(bus->publish(std::vector<uint8_t>(101, 1)), ErrorCode::MESSAGE_TOO_LARGE);
+  auto bus = make_bus(name, test_config(BackPressureMode::RELIABLE, 64, 100));
+  EXPECT_TRUE(bus->publish(std::vector<uint8_t>(100, 1)));
+  EXPECT_EQ(bus->publish(std::vector<uint8_t>(101, 1)), std::unexpected(Error::MESSAGE_TOO_LARGE));
 }
 
 TEST(Segment, CreatedWithRequestedPermissions) {
   ScopedBusName a, b;
   {
-    auto bus = create_bus(a, test_config());
+    auto bus = make_bus(a, test_config());
     struct stat st{};
     ASSERT_EQ(stat(a.shm_path().c_str(), &st), 0);
     EXPECT_EQ(st.st_mode & 0777, 0600u);
@@ -82,7 +110,7 @@ TEST(Segment, CreatedWithRequestedPermissions) {
   {
     Config config = test_config();
     config.shm_permissions = 0640;
-    auto bus = create_bus(b, config);
+    auto bus = make_bus(b, config);
     struct stat st{};
     ASSERT_EQ(stat(b.shm_path().c_str(), &st), 0);
     EXPECT_EQ(st.st_mode & 0777, 0640u);
@@ -91,8 +119,8 @@ TEST(Segment, CreatedWithRequestedPermissions) {
 
 TEST(Segment, SecondMappingSharesMemory) {
   ScopedBusName name;
-  auto first = shm::SegmentMapping::open_or_create(seg(name), test_config());
-  auto second = shm::SegmentMapping::open_or_create(seg(name), test_config());
+  auto first = shm::SegmentMapping::open_or_create(seg(name), test_config().layout(), test_config().options()).value();
+  auto second = shm::SegmentMapping::open_or_create(seg(name), test_config().layout(), test_config().options()).value();
   ASSERT_NE(first->segment(), second->segment());
   first->payload_at(5)[0] = 0xAB;
   EXPECT_EQ(second->payload_at(5)[0], 0xAB);
@@ -102,7 +130,7 @@ TEST(Segment, SecondMappingSharesMemory) {
 
 TEST(Segment, SlotLayoutIsCacheAlignedAndNonOverlapping) {
   ScopedBusName name;
-  auto mapping = shm::SegmentMapping::open_or_create(seg(name), test_config(BackPressureMode::RELIABLE, 8, 100));
+  auto mapping = shm::SegmentMapping::open_or_create(seg(name), test_config(BackPressureMode::RELIABLE, 8, 100).layout(), test_config(BackPressureMode::RELIABLE, 8, 100).options()).value();
   for (uint64_t seq = 0; seq < 8; ++seq) {
     const auto header = reinterpret_cast<uintptr_t>(mapping->header_at(seq));
     EXPECT_EQ(header % shm::CACHE_LINE_SIZE, 0u);
@@ -120,7 +148,7 @@ TEST(Segment, RegistrySizedByConfigSitsBetweenHeaderAndSlots) {
     ScopedBusName name;
     Config config = test_config(BackPressureMode::RELIABLE, 8, 100);
     config.max_subscribers = count;
-    auto mapping = shm::SegmentMapping::open_or_create(seg(name), config);
+    auto mapping = shm::SegmentMapping::open_or_create(seg(name), config.layout(), config.options()).value();
     ASSERT_EQ(mapping->subscriber_count(), count);
 
     const auto base = reinterpret_cast<uintptr_t>(mapping->segment());
@@ -132,33 +160,33 @@ TEST(Segment, RegistrySizedByConfigSitsBetweenHeaderAndSlots) {
     EXPECT_EQ(mapping->subscriber(count - 1).state.load(), uint32_t(shm::SubscriberState::EMPTY));
 
     // Another process sees the same registry
-    auto other = shm::SegmentMapping::open_or_create(seg(name), config);
+    auto other = shm::SegmentMapping::open_or_create(seg(name), config.layout(), config.options()).value();
     mapping->subscriber(count - 1).pid = 1234;
     EXPECT_EQ(other->subscriber(count - 1).pid.load(), 1234);
   }
 }
 
-TEST(Segment, RejectsMismatchedConfig) {
+TEST(Segment, RejectsMismatchedLayout) {
   ScopedBusName name;
-  auto bus = create_bus(name, test_config(BackPressureMode::RELIABLE, 64, 256));
+  auto bus = make_bus(name, test_config(BackPressureMode::RELIABLE, 64, 256));
 
-  EXPECT_NE(error_message([&] { create_bus(name, test_config(BackPressureMode::RELIABLE, 64, 512)); }).find("slot size"), std::string::npos);
-  EXPECT_NE(error_message([&] { create_bus(name, test_config(BackPressureMode::RELIABLE, 128, 256)); }).find("slot count"), std::string::npos);
+  EXPECT_NE(logged_errors([&] { EXPECT_EQ(try_create(name, test_config(BackPressureMode::RELIABLE, 64, 512)), std::unexpected(Error::INCOMPATIBLE)); }).find("asked for max_message_size=512"), std::string::npos);
+  EXPECT_NE(logged_errors([&] { EXPECT_EQ(try_create(name, test_config(BackPressureMode::RELIABLE, 128, 256)), std::unexpected(Error::INCOMPATIBLE)); }).find("asked for max_message_size=256 bus_size=128"), std::string::npos);
   Config more_subscribers = test_config(BackPressureMode::RELIABLE, 64, 256);
   more_subscribers.max_subscribers = 512;
-  EXPECT_NE(error_message([&] { create_bus(name, more_subscribers); }).find("max subscribers"), std::string::npos);
-  EXPECT_NO_THROW(create_bus(name, test_config(BackPressureMode::RELIABLE, 64, 256)));
+  EXPECT_NE(logged_errors([&] { EXPECT_EQ(try_create(name, more_subscribers), std::unexpected(Error::INCOMPATIBLE)); }).find("max_subscribers=512"), std::string::npos);
+  EXPECT_NE(make_bus(name, test_config(BackPressureMode::RELIABLE, 64, 256)), nullptr);
   // The mode is each subscriber's own choice, so it needn't match
-  EXPECT_NO_THROW(create_bus(name, test_config(BackPressureMode::BEST_EFFORT, 64, 256)));
+  EXPECT_NE(make_bus(name, test_config(BackPressureMode::BEST_EFFORT, 64, 256)), nullptr);
 }
 
 TEST(Segment, RejectsIncompatibleVersionOrMagic) {
   ScopedBusName name;
   {
-    auto mapping = shm::SegmentMapping::open_or_create(seg(name), test_config());
+    auto mapping = shm::SegmentMapping::open_or_create(seg(name), test_config().layout(), test_config().options()).value();
     mapping->segment()->version = shm::VERSION + 1;
   }
-  EXPECT_NE(error_message([&] { create_bus(name, test_config()); }).find("version"), std::string::npos);
+  EXPECT_NE(logged_errors([&] { EXPECT_EQ(try_create(name, test_config()), std::unexpected(Error::INCOMPATIBLE)); }).find("version"), std::string::npos);
   {
     // Fix the version, break the magic
     const int fd = shm_open(seg(name).c_str(), O_RDWR, 0);
@@ -169,16 +197,16 @@ TEST(Segment, RejectsIncompatibleVersionOrMagic) {
     munmap(segment, sizeof(shm::SHMSegment));
     close(fd);
   }
-  EXPECT_NE(error_message([&] { create_bus(name, test_config()); }).find("magic"), std::string::npos);
+  EXPECT_NE(logged_errors([&] { EXPECT_EQ(try_create(name, test_config()), std::unexpected(Error::INCOMPATIBLE)); }).find("magic"), std::string::npos);
 }
 
 TEST(Segment, RejectsLayoutDrift) {
   ScopedBusName name;
   {
-    auto mapping = shm::SegmentMapping::open_or_create(seg(name), test_config());
+    auto mapping = shm::SegmentMapping::open_or_create(seg(name), test_config().layout(), test_config().options()).value();
     mapping->segment()->subscriber_entry_bytes += 64;
   }
-  EXPECT_NE(error_message([&] { create_bus(name, test_config()); }).find("subscriber entry size"), std::string::npos);
+  EXPECT_NE(logged_errors([&] { EXPECT_EQ(try_create(name, test_config()), std::unexpected(Error::INCOMPATIBLE)); }).find("subscriber entry size"), std::string::npos);
 }
 
 TEST(Segment, TimesOutOnSegmentThatWasNeverSized) {
@@ -191,7 +219,7 @@ TEST(Segment, TimesOutOnSegmentThatWasNeverSized) {
   Config config = test_config();
   config.init_timeout_ms = 50;
   const auto start = std::chrono::steady_clock::now();
-  const std::string message = error_message([&] { create_bus(name, config); });
+  const std::string message = logged_errors([&] { EXPECT_EQ(try_create(name, config), std::unexpected(Error::SYSTEM_ERROR)); });
   EXPECT_NE(message.find("Timed out"), std::string::npos) << message;
   EXPECT_NE(message.find("destroy_bus"), std::string::npos) << message;
   EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(2));
@@ -207,11 +235,11 @@ TEST(Segment, TimesOutOnSegmentThatWasNeverInitialised) {
 
   Config config = test_config();
   config.init_timeout_ms = 50;
-  EXPECT_NE(error_message([&] { create_bus(name, config); }).find("not initialised"), std::string::npos);
+  EXPECT_NE(logged_errors([&] { EXPECT_EQ(try_create(name, config), std::unexpected(Error::SYSTEM_ERROR)); }).find("not initialised"), std::string::npos);
 
   // The documented recovery works
-  EXPECT_EQ(destroy_bus(name), ErrorCode::OK);
-  EXPECT_NO_THROW(create_bus(name, config));
+  EXPECT_TRUE(destroy_bus(name));
+  EXPECT_NE(make_bus(name, config), nullptr);
 }
 
 TEST(Segment, ConcurrentCreateAndOpenAgree) {
@@ -221,7 +249,7 @@ TEST(Segment, ConcurrentCreateAndOpenAgree) {
     std::vector<std::shared_ptr<shm::SegmentMapping>> mappings(8);
     std::vector<std::thread> threads;
     for (size_t i = 0; i < mappings.size(); ++i) {
-      threads.emplace_back([&, i] { mappings[i] = shm::SegmentMapping::open_or_create(seg(name), test_config()); });
+      threads.emplace_back([&, i] { mappings[i] = shm::SegmentMapping::open_or_create(seg(name), test_config().layout(), test_config().options()).value(); });
     }
     for (auto& t : threads) t.join();
     mappings[0]->segment()->write_seq.store(uint64_t(round) + 1);
@@ -235,7 +263,7 @@ TEST(Segment, ConcurrentCreateAndOpenAgree) {
 TEST(Segment, LargeBusSizeDoesNotOverflow) {
   // 2^20 slots * 4 KiB used to overflow 32-bit arithmetic into a 64 MB segment and crash on publish
   ScopedBusName name;
-  auto mapping = shm::SegmentMapping::open_or_create(seg(name), test_config(BackPressureMode::BEST_EFFORT, 1u << 20, 4096));
+  auto mapping = shm::SegmentMapping::open_or_create(seg(name), test_config(BackPressureMode::BEST_EFFORT, 1u << 20, 4096).layout(), test_config(BackPressureMode::BEST_EFFORT, 1u << 20, 4096).options()).value();
   struct stat st{};
   ASSERT_EQ(stat(name.shm_path().c_str(), &st), 0);
   EXPECT_GE(uint64_t(st.st_size), (uint64_t(1) << 20) * 4096);
@@ -247,22 +275,22 @@ TEST(Segment, LargeBusSizeDoesNotOverflow) {
 
 TEST(Segment, DestroyBus) {
   ScopedBusName name;
-  EXPECT_EQ(destroy_bus(name), ErrorCode::NOT_FOUND);
+  EXPECT_EQ(destroy_bus(name), std::unexpected(Error::NOT_FOUND));
   {
-    auto bus = create_bus(name, test_config());
+    auto bus = make_bus(name, test_config());
   }
   EXPECT_EQ(access(name.shm_path().c_str(), F_OK), 0) << "segment should outlive its last Bus";
-  EXPECT_EQ(destroy_bus(name), ErrorCode::OK);
+  EXPECT_TRUE(destroy_bus(name));
   EXPECT_EQ(access(name.shm_path().c_str(), F_OK), -1);
-  EXPECT_EQ(destroy_bus(name), ErrorCode::NOT_FOUND);
+  EXPECT_EQ(destroy_bus(name), std::unexpected(Error::NOT_FOUND));
 }
 
 TEST(Segment, DestroyedBusKeepsWorkingForExistingUsers) {
   ScopedBusName name;
-  auto bus = create_bus(name, test_config());
+  auto bus = make_bus(name, test_config());
   std::atomic_int received{0};
-  ASSERT_EQ(bus->add_subscriber([&](const Message&) { ++received; }), ErrorCode::OK);
-  ASSERT_EQ(destroy_bus(name), ErrorCode::OK);
-  ASSERT_EQ(bus->publish(as_bytes("still here")), ErrorCode::OK);
+  ASSERT_TRUE(bus->add_subscriber([&](const Message&) { ++received; }));
+  ASSERT_TRUE(destroy_bus(name));
+  ASSERT_TRUE(bus->publish(as_bytes("still here")));
   EXPECT_TRUE(wait_until([&] { return received == 1; }));
 }

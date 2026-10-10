@@ -16,7 +16,7 @@ using ReadResult = shm::RingBuffer::ReadResult;
 namespace {
 struct RingFixture {
   explicit RingFixture(uint32_t slots = 8, uint32_t slot_size = 128)
-      : mapping(shm::SegmentMapping::open_or_create("/redline." + name.str(), test_config(BackPressureMode::BEST_EFFORT, slots, slot_size))),
+      : mapping(shm::SegmentMapping::open_or_create("/redline." + name.str(), test_config(BackPressureMode::BEST_EFFORT, slots, slot_size).layout(), test_config(BackPressureMode::BEST_EFFORT, slots, slot_size).options()).value()),
         ring(mapping),
         out(slot_size) {}
 

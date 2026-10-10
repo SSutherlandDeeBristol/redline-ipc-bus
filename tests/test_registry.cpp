@@ -18,7 +18,7 @@ using shm::SubscriberState;
 namespace {
 struct RegistryFixture {
   RegistryFixture()
-      : mapping(shm::SegmentMapping::open_or_create("/redline." + name.str(), test_config(BackPressureMode::RELIABLE, 16))),
+      : mapping(shm::SegmentMapping::open_or_create("/redline." + name.str(), test_config(BackPressureMode::RELIABLE, 16).layout(), test_config(BackPressureMode::RELIABLE, 16).options()).value()),
         registry(mapping),
         segment(mapping->segment()) {}
 
@@ -31,7 +31,7 @@ struct RegistryFixture {
   uint32_t capacity() const { return mapping->subscriber_count(); }
 
   std::unique_ptr<SubscriberLease> claim(uint32_t flags = shm::SUBSCRIBER_RELIABLE) {
-    auto lease = registry.register_subscriber(flags);
+    auto lease = registry.register_subscriber(flags).value_or(nullptr);
     EXPECT_NE(lease, nullptr);
     return lease;
   }
@@ -51,20 +51,20 @@ TEST(Registry, ClaimsDistinctEntriesUntilFull) {
   std::vector<std::unique_ptr<SubscriberLease>> leases;
   std::set<uint32_t> claimed;
   for (uint32_t i = 0; i < f.capacity(); ++i) {
-    leases.push_back(f.registry.register_subscriber());
+    leases.push_back(f.registry.register_subscriber().value_or(nullptr));
     ASSERT_NE(leases.back(), nullptr);
     const uint32_t index = leases.back()->index();
     EXPECT_TRUE(claimed.insert(index).second);
     EXPECT_EQ(f.state(index), SubscriberState::OK);
     EXPECT_EQ(f.mapping->subscriber(index).pid.load(), getpid());
   }
-  EXPECT_EQ(f.registry.register_subscriber(), nullptr);
+  EXPECT_EQ(f.registry.register_subscriber().value_or(nullptr), nullptr);
 
   // Destroying a lease deregisters its entry
   const uint32_t freed = leases[17]->index();
   leases[17].reset();
   EXPECT_EQ(f.state(freed), SubscriberState::EMPTY);
-  auto again = f.registry.register_subscriber();
+  auto again = f.registry.register_subscriber().value_or(nullptr);
   ASSERT_NE(again, nullptr);
   EXPECT_EQ(again->index(), freed);
 }
@@ -146,13 +146,13 @@ TEST(Registry, LeasesInOneProcessConflictWithEachOther) {
   // Every lease uses its own file description, so a second registration in the same process (or through another
   // mapping of the same bus) can never take an entry that is already leased
   RegistryFixture f;
-  auto other_mapping = shm::SegmentMapping::open_or_create("/redline." + f.name.str(), test_config(BackPressureMode::RELIABLE, 16));
+  auto other_mapping = shm::SegmentMapping::open_or_create("/redline." + f.name.str(), test_config(BackPressureMode::RELIABLE, 16).layout(), test_config(BackPressureMode::RELIABLE, 16).options()).value();
   shm::SubscriberRegistry other(other_mapping);
 
   auto a = f.claim();
   // Pretend the entry was wrongly left EMPTY: the held lease must still stop anyone claiming it
   a->entry().state = uint32_t(SubscriberState::EMPTY);
-  auto b = other.register_subscriber();
+  auto b = other.register_subscriber().value_or(nullptr);
   ASSERT_NE(b, nullptr);
   EXPECT_NE(b->index(), a->index());
   EXPECT_TRUE(other.lease_held(a->index()));
@@ -195,7 +195,7 @@ TEST(Registry, RegisterReapsWhenFull) {
     f.crashed();
   }
   // Every entry belongs to a crashed owner, so registering must reclaim them rather than report full
-  EXPECT_NE(f.registry.register_subscriber(), nullptr);
+  EXPECT_NE(f.registry.register_subscriber().value_or(nullptr), nullptr);
 }
 
 TEST(Registry, EvictsStalledSubscribersOnlyWhenConfigured) {
@@ -244,7 +244,7 @@ TEST(Registry, ConcurrentRegistrationNeverDoubleClaims) {
   for (size_t t = 0; t < claimed.size(); ++t) {
     threads.emplace_back([&, t] {
       for (int i = 0; i < 32; ++i) {
-        if (auto lease = f.registry.register_subscriber()) claimed[t].push_back(std::move(lease));
+        if (auto lease = f.registry.register_subscriber().value_or(nullptr)) claimed[t].push_back(std::move(lease));
       }
     });
   }
@@ -269,7 +269,7 @@ TEST(Registry, ConcurrentReapingAndRegistrationNeverStealLiveEntries) {
   for (int w = 0; w < 4; ++w) {
     threads.emplace_back([&] {
       for (int i = 0; i < 2000; ++i) {
-        auto lease = f.registry.register_subscriber();
+        auto lease = f.registry.register_subscriber().value_or(nullptr);
         if (!lease) continue;
         for (int k = 0; k < 10; ++k) {
           if (f.state(lease->index()) != SubscriberState::OK) ++stolen;

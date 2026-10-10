@@ -51,12 +51,12 @@ std::string mode_name(const ::testing::TestParamInfo<BackPressureMode>& info) {
 TEST_P(BusAnyMode, DeliversMessagesInOrderWithContents) {
   ScopedBusName name;
   Collector collector;
-  auto bus = create_bus(name, config());
-  ASSERT_EQ(bus->add_subscriber(collector.callback()), ErrorCode::OK);
+  auto bus = make_bus(name, config());
+  ASSERT_TRUE(bus->add_subscriber(collector.callback()));
 
   const int64_t before = now_ns();
   for (uint32_t i = 0; i < 40; ++i) {
-    ASSERT_EQ(bus->publish(make_payload(1, i, 16 + i * 5)), ErrorCode::OK);
+    ASSERT_TRUE(bus->publish(make_payload(1, i, 16 + i * 5)));
   }
   ASSERT_TRUE(wait_until([&] { return collector.size() == 40; }));
   const int64_t after = now_ns();
@@ -77,19 +77,19 @@ TEST_P(BusAnyMode, DeliversMessagesInOrderWithContents) {
 TEST_P(BusAnyMode, EmptyAndMaximumSizeMessages) {
   ScopedBusName name;
   Collector collector;
-  auto bus = create_bus(name, config());
-  ASSERT_EQ(bus->add_subscriber(collector.callback()), ErrorCode::OK);
+  auto bus = make_bus(name, config());
+  ASSERT_TRUE(bus->add_subscriber(collector.callback()));
 
   const std::vector<uint8_t> max(config().max_message_size, 0x5A);
-  EXPECT_EQ(bus->publish(std::span<const uint8_t>{}), ErrorCode::OK);
-  EXPECT_EQ(bus->publish(max), ErrorCode::OK);
-  EXPECT_EQ(bus->publish(std::vector<uint8_t>(config().max_message_size + 1)), ErrorCode::MESSAGE_TOO_LARGE);
+  EXPECT_TRUE(bus->publish(std::span<const uint8_t>{}));
+  EXPECT_TRUE(bus->publish(max));
+  EXPECT_EQ(bus->publish(std::vector<uint8_t>(config().max_message_size + 1)), std::unexpected(Error::MESSAGE_TOO_LARGE));
 
   ASSERT_TRUE(wait_until([&] { return collector.size() == 2; }));
   EXPECT_TRUE(collector.payloads[0].empty());
   EXPECT_EQ(collector.payloads[1], max);
   // The rejected message must not have consumed a sequence number
-  EXPECT_EQ(bus->publish(as_bytes("next")), ErrorCode::OK);
+  EXPECT_TRUE(bus->publish(as_bytes("next")));
   ASSERT_TRUE(wait_until([&] { return collector.size() == 3; }));
   EXPECT_EQ(collector.sequences[2], 2u);
 }
@@ -97,14 +97,14 @@ TEST_P(BusAnyMode, EmptyAndMaximumSizeMessages) {
 TEST_P(BusAnyMode, PublishesStrings) {
   ScopedBusName name;
   Collector collector;
-  auto bus = create_bus(name, config());
-  ASSERT_EQ(bus->add_subscriber(collector.callback()), ErrorCode::OK);
+  auto bus = make_bus(name, config());
+  ASSERT_TRUE(bus->add_subscriber(collector.callback()));
 
   const std::string owned = "from a std::string";
-  ASSERT_EQ(bus->publish("literal"), ErrorCode::OK);
-  ASSERT_EQ(bus->publish(owned), ErrorCode::OK);
-  ASSERT_EQ(bus->publish(std::string_view()), ErrorCode::OK);
-  EXPECT_EQ(bus->publish(std::string(config().max_message_size + 1, 'x')), ErrorCode::MESSAGE_TOO_LARGE);
+  ASSERT_TRUE(bus->publish("literal"));
+  ASSERT_TRUE(bus->publish(owned));
+  ASSERT_TRUE(bus->publish(std::string_view()));
+  EXPECT_EQ(bus->publish(std::string(config().max_message_size + 1, 'x')), std::unexpected(Error::MESSAGE_TOO_LARGE));
 
   ASSERT_TRUE(wait_until([&] { return collector.size() == 3; }));
   const auto text = [&](size_t i) { return std::string(collector.payloads[i].begin(), collector.payloads[i].end()); };
@@ -116,12 +116,12 @@ TEST_P(BusAnyMode, PublishesStrings) {
 TEST_P(BusAnyMode, AllCallbacksOnABusReceiveEveryMessage) {
   ScopedBusName name;
   Collector a, b, c;
-  auto bus = create_bus(name, config());
-  ASSERT_EQ(bus->add_subscriber(a.callback()), ErrorCode::OK);
-  ASSERT_EQ(bus->add_subscriber(b.callback()), ErrorCode::OK);
-  ASSERT_EQ(bus->add_subscriber(create_subscriber(c.callback())), ErrorCode::OK);
+  auto bus = make_bus(name, config());
+  ASSERT_TRUE(bus->add_subscriber(a.callback()));
+  ASSERT_TRUE(bus->add_subscriber(b.callback()));
+  ASSERT_TRUE(bus->add_subscriber(c.callback()));
 
-  for (uint32_t i = 0; i < 20; ++i) ASSERT_EQ(bus->publish(make_payload(0, i, 32)), ErrorCode::OK);
+  for (uint32_t i = 0; i < 20; ++i) ASSERT_TRUE(bus->publish(make_payload(0, i, 32)));
   ASSERT_TRUE(wait_until([&] { return a.size() == 20 && b.size() == 20 && c.size() == 20; }));
   EXPECT_EQ(a.payloads, b.payloads);
   EXPECT_EQ(a.payloads, c.payloads);
@@ -130,15 +130,15 @@ TEST_P(BusAnyMode, AllCallbacksOnABusReceiveEveryMessage) {
 TEST_P(BusAnyMode, EverySubscriberBusReceivesEveryMessage) {
   ScopedBusName name;
   std::vector<std::unique_ptr<Collector>> collectors;
-  auto publisher = create_bus(name, config());
+  auto publisher = make_bus(name, config());
   std::vector<std::unique_ptr<Bus>> subscribers;
   for (int i = 0; i < 4; ++i) {
-    subscribers.push_back(create_bus(name, config()));
+    subscribers.push_back(make_bus(name, config()));
     collectors.push_back(std::make_unique<Collector>());
-    ASSERT_EQ(subscribers.back()->add_subscriber(collectors.back()->callback()), ErrorCode::OK);
+    ASSERT_TRUE(subscribers.back()->add_subscriber(collectors.back()->callback()));
   }
 
-  for (uint32_t i = 0; i < 50; ++i) ASSERT_EQ(publisher->publish(make_payload(0, i, 64)), ErrorCode::OK);
+  for (uint32_t i = 0; i < 50; ++i) ASSERT_TRUE(publisher->publish(make_payload(0, i, 64)));
   for (auto& collector : collectors) {
     ASSERT_TRUE(wait_until([&] { return collector->size() == 50; }));
     EXPECT_EQ(collector->payloads, collectors[0]->payloads);
@@ -147,13 +147,13 @@ TEST_P(BusAnyMode, EverySubscriberBusReceivesEveryMessage) {
 
 TEST_P(BusAnyMode, LateSubscriberStartsAtHead) {
   ScopedBusName name;
-  auto bus = create_bus(name, config());
-  for (uint32_t i = 0; i < 10; ++i) ASSERT_EQ(bus->publish(make_payload(0, i, 16)), ErrorCode::OK);
+  auto bus = make_bus(name, config());
+  for (uint32_t i = 0; i < 10; ++i) ASSERT_TRUE(bus->publish(make_payload(0, i, 16)));
 
   Collector collector;
-  auto late = create_bus(name, config());
-  ASSERT_EQ(late->add_subscriber(collector.callback()), ErrorCode::OK);
-  ASSERT_EQ(bus->publish(make_payload(0, 10, 16)), ErrorCode::OK);
+  auto late = make_bus(name, config());
+  ASSERT_TRUE(late->add_subscriber(collector.callback()));
+  ASSERT_TRUE(bus->publish(make_payload(0, 10, 16)));
   ASSERT_TRUE(wait_until([&] { return collector.size() == 1; }));
   std::this_thread::sleep_for(20ms);
   EXPECT_EQ(collector.size(), 1u);
@@ -163,25 +163,25 @@ TEST_P(BusAnyMode, LateSubscriberStartsAtHead) {
 TEST_P(BusAnyMode, ThrowingCallbacksDoNotStopDelivery) {
   ScopedBusName name;
   Collector collector;
-  auto bus = create_bus(name, config());
-  ASSERT_EQ(bus->add_subscriber([](const Message& m) {
+  auto bus = make_bus(name, config());
+  ASSERT_TRUE(bus->add_subscriber([](const Message& m) {
     if (m.sequence == 0) throw std::runtime_error("std exception");
     if (m.sequence == 1) throw 42; // not a std::exception, used to terminate the process
-  }), ErrorCode::OK);
-  ASSERT_EQ(bus->add_subscriber(collector.callback()), ErrorCode::OK);
+  }));
+  ASSERT_TRUE(bus->add_subscriber(collector.callback()));
 
-  for (uint32_t i = 0; i < 3; ++i) ASSERT_EQ(bus->publish(make_payload(0, i, 16)), ErrorCode::OK);
+  for (uint32_t i = 0; i < 3; ++i) ASSERT_TRUE(bus->publish(make_payload(0, i, 16)));
   ASSERT_TRUE(wait_until([&] { return collector.size() == 3; }));
 }
 
 TEST_P(BusAnyMode, MetricsTrackConsumptionAndLatency) {
   ScopedBusName name;
   std::atomic_int received{0};
-  auto bus = create_bus(name, config());
-  ASSERT_EQ(bus->add_subscriber([&](const Message&) { ++received; }), ErrorCode::OK);
+  auto bus = make_bus(name, config());
+  ASSERT_TRUE(bus->add_subscriber([&](const Message&) { ++received; }));
 
   for (uint32_t i = 0; i < 1000; ++i) {
-    ASSERT_EQ(bus->publish(make_payload(0, i, 16)), ErrorCode::OK);
+    ASSERT_TRUE(bus->publish(make_payload(0, i, 16)));
     if (i % 32 == 31) {
       ASSERT_TRUE(wait_until([&] { return received == int(i) + 1; })); // keep BEST_EFFORT from lapping the subscriber
     }
@@ -213,24 +213,23 @@ INSTANTIATE_TEST_SUITE_P(Modes, BusAnyMode,
 
 TEST(Bus, RejectsEmptyCallbacks) {
   ScopedBusName name;
-  auto bus = create_bus(name, test_config());
-  EXPECT_EQ(bus->add_subscriber(std::function<void(const Message&)>{}), ErrorCode::INVALID_ARGUMENT);
-  EXPECT_EQ(bus->add_subscriber(std::shared_ptr<Subscriber>{}), ErrorCode::INVALID_ARGUMENT);
+  auto bus = make_bus(name, test_config());
+  EXPECT_EQ(bus->add_subscriber(std::function<void(const Message&)>{}), std::unexpected(Error::INVALID_ARGUMENT));
   // Neither attempt should have registered this bus as a subscriber
   EXPECT_EQ(bus->get_subscriber_metrics().messages_consumed, 0u);
-  auto other = create_bus(name, test_config());
-  ASSERT_EQ(other->add_subscriber([](const Message&) {}), ErrorCode::OK);
+  auto other = make_bus(name, test_config());
+  ASSERT_TRUE(other->add_subscriber([](const Message&) {}));
 }
 
 TEST(Bus, NoLimitOnCallbacks) {
   ScopedBusName name;
   constexpr int callbacks = 1000;
   std::atomic_int received{0};
-  auto bus = create_bus(name, test_config());
+  auto bus = make_bus(name, test_config());
   for (int i = 0; i < callbacks; ++i) {
-    ASSERT_EQ(bus->add_subscriber([&](const Message&) { ++received; }), ErrorCode::OK) << i;
+    ASSERT_TRUE(bus->add_subscriber([&](const Message&) { ++received; })) << i;
   }
-  ASSERT_EQ(bus->publish(as_bytes("to everyone")), ErrorCode::OK);
+  ASSERT_TRUE(bus->publish(as_bytes("to everyone")));
   EXPECT_TRUE(wait_until([&] { return received == callbacks; }));
 }
 
@@ -241,16 +240,16 @@ TEST(Bus, CallbacksCanBeAddedWhileMessagesAreDelivered) {
   constexpr uint64_t messages = 20'000;
   std::vector<std::unique_ptr<Received>> received;
   for (int i = 0; i < callbacks; ++i) received.push_back(std::make_unique<Received>());
-  auto bus = create_bus(name, test_config(BackPressureMode::RELIABLE, 64));
+  auto bus = make_bus(name, test_config(BackPressureMode::RELIABLE, 64));
 
   // The first callback subscribes the Bus, so it must exist before publishing starts to see every message
-  ASSERT_EQ(bus->add_subscriber([sink = received[0].get()](const Message& m) { sink->add(m.sequence); }), ErrorCode::OK);
+  ASSERT_TRUE(bus->add_subscriber([sink = received[0].get()](const Message& m) { sink->add(m.sequence); }));
   std::thread publisher([&] {
-    for (uint64_t i = 0; i < messages; ++i) ASSERT_EQ(bus->publish(make_payload(0, i, 16), 5'000'000), ErrorCode::OK);
+    for (uint64_t i = 0; i < messages; ++i) ASSERT_TRUE(bus->publish(make_payload(0, i, 16), 5'000'000));
   });
   for (int i = 1; i < callbacks; ++i) {
     auto* sink = received[size_t(i)].get();
-    ASSERT_EQ(bus->add_subscriber([sink](const Message& m) { sink->add(m.sequence); }), ErrorCode::OK);
+    ASSERT_TRUE(bus->add_subscriber([sink](const Message& m) { sink->add(m.sequence); }));
     std::this_thread::sleep_for(std::chrono::microseconds(200));
   }
   publisher.join();
@@ -270,11 +269,11 @@ TEST(Bus, CallbacksCanBeAddedWhileMessagesAreDelivered) {
 TEST(Bus, MetricsAreZeroWithoutSubscriber) {
   ScopedBusName name;
   std::atomic_int received{0};
-  auto subscriber = create_bus(name, test_config());
-  ASSERT_EQ(subscriber->add_subscriber([&](const Message&) { ++received; }), ErrorCode::OK);
+  auto subscriber = make_bus(name, test_config());
+  ASSERT_TRUE(subscriber->add_subscriber([&](const Message&) { ++received; }));
 
-  auto publisher = create_bus(name, test_config());
-  for (int i = 0; i < 5; ++i) ASSERT_EQ(publisher->publish(as_bytes("x")), ErrorCode::OK);
+  auto publisher = make_bus(name, test_config());
+  for (int i = 0; i < 5; ++i) ASSERT_TRUE(publisher->publish(as_bytes("x")));
   ASSERT_TRUE(wait_until([&] { return received == 5; }));
 
   // Used to report whichever subscriber happened to be in registry slot 0
@@ -288,21 +287,21 @@ TEST(Bus, DestroyingPublisherOnlyBusKeepsOtherSubscribers) {
   // A Bus that never subscribed used to deregister registry slot 0 - someone else's subscriber - when destroyed
   ScopedBusName name;
   Collector collector;
-  auto subscriber = create_bus(name, test_config());
-  ASSERT_EQ(subscriber->add_subscriber(collector.callback()), ErrorCode::OK);
+  auto subscriber = make_bus(name, test_config());
+  ASSERT_TRUE(subscriber->add_subscriber(collector.callback()));
 
   {
-    auto publisher = create_bus(name, test_config());
-    ASSERT_EQ(publisher->publish(as_bytes("one")), ErrorCode::OK);
+    auto publisher = make_bus(name, test_config());
+    ASSERT_TRUE(publisher->publish(as_bytes("one")));
   }
 
   // If our registration had been wiped, a new subscriber would share it and RELIABLE backpressure would ignore us
   Collector second_collector;
-  auto second = create_bus(name, test_config());
-  ASSERT_EQ(second->add_subscriber(second_collector.callback()), ErrorCode::OK);
+  auto second = make_bus(name, test_config());
+  ASSERT_TRUE(second->add_subscriber(second_collector.callback()));
 
-  auto publisher = create_bus(name, test_config());
-  ASSERT_EQ(publisher->publish(as_bytes("two")), ErrorCode::OK);
+  auto publisher = make_bus(name, test_config());
+  ASSERT_TRUE(publisher->publish(as_bytes("two")));
   ASSERT_TRUE(wait_until([&] { return collector.size() == 2 && second_collector.size() == 1; }));
   std::this_thread::sleep_for(20ms);
   EXPECT_EQ(collector.size(), 2u);
@@ -318,19 +317,19 @@ TEST(Bus, RegistryFullIsReportedAndRecoverable) {
   config.max_subscribers = 16;
   std::vector<std::unique_ptr<Bus>> buses;
   for (uint32_t i = 0; i < config.max_subscribers; ++i) {
-    buses.push_back(create_bus(name, config));
-    ASSERT_EQ(buses.back()->add_subscriber([](const Message&) {}), ErrorCode::OK) << i;
+    buses.push_back(make_bus(name, config));
+    ASSERT_TRUE(buses.back()->add_subscriber([](const Message&) {})) << i;
   }
 
-  auto overflow = create_bus(name, config);
-  EXPECT_EQ(overflow->add_subscriber([](const Message&) {}), ErrorCode::SUBSCRIBER_REGISTRY_FULL);
+  auto overflow = make_bus(name, config);
+  EXPECT_EQ(overflow->add_subscriber([](const Message&) {}), std::unexpected(Error::SUBSCRIBER_REGISTRY_FULL));
   // Used to return OK here, with no poll thread behind it
-  EXPECT_EQ(overflow->add_subscriber([](const Message&) {}), ErrorCode::SUBSCRIBER_REGISTRY_FULL);
+  EXPECT_EQ(overflow->add_subscriber([](const Message&) {}), std::unexpected(Error::SUBSCRIBER_REGISTRY_FULL));
   EXPECT_EQ(overflow->get_subscriber_metrics().messages_consumed, 0u);
 
   buses.pop_back();
-  ASSERT_EQ(overflow->add_subscriber([&](const Message&) { ++received; }), ErrorCode::OK);
-  ASSERT_EQ(overflow->publish(as_bytes("hello")), ErrorCode::OK);
+  ASSERT_TRUE(overflow->add_subscriber([&](const Message&) { ++received; }));
+  ASSERT_TRUE(overflow->publish(as_bytes("hello")));
   EXPECT_TRUE(wait_until([&] { return received == 1; }));
 
   // Destroying everything (including the bus that was once rejected) must not touch memory outside the registry
@@ -342,8 +341,8 @@ TEST(Bus, DestructorDoesNotHangWithIdleSubscriber) {
   ScopedBusName name;
   Config config = test_config();
   config.consumer_busy_spin_duration_us = 0;
-  auto bus = create_bus(name, config);
-  ASSERT_EQ(bus->add_subscriber([](const Message&) {}), ErrorCode::OK);
+  auto bus = make_bus(name, config);
+  ASSERT_TRUE(bus->add_subscriber([](const Message&) {}));
   std::this_thread::sleep_for(100ms); // let the poll thread go to sleep on the futex
 
   const auto start = std::chrono::steady_clock::now();
@@ -353,13 +352,13 @@ TEST(Bus, DestructorDoesNotHangWithIdleSubscriber) {
 
 TEST(Bus, DestructorWithSubscriberDeregisters) {
   ScopedBusName name;
-  auto publisher = create_bus(name, test_config(BackPressureMode::RELIABLE, 4));
+  auto publisher = make_bus(name, test_config(BackPressureMode::RELIABLE, 4));
   {
-    auto subscriber = create_bus(name, test_config(BackPressureMode::RELIABLE, 4));
-    ASSERT_EQ(subscriber->add_subscriber([](const Message&) {}), ErrorCode::OK);
+    auto subscriber = make_bus(name, test_config(BackPressureMode::RELIABLE, 4));
+    ASSERT_TRUE(subscriber->add_subscriber([](const Message&) {}));
   }
   // With the subscriber gone nothing can apply backpressure
-  for (int i = 0; i < 20; ++i) ASSERT_EQ(publisher->publish(as_bytes("x"), 0), ErrorCode::OK);
+  for (int i = 0; i < 20; ++i) ASSERT_TRUE(publisher->publish(as_bytes("x"), 0));
 }
 
 TEST(Bus, SleepingSubscriberIsWokenByPublish) {
@@ -367,13 +366,13 @@ TEST(Bus, SleepingSubscriberIsWokenByPublish) {
   Config config = test_config();
   config.consumer_busy_spin_duration_us = 0;
   std::atomic_int64_t latency_ns{-1};
-  auto bus = create_bus(name, config);
-  ASSERT_EQ(bus->add_subscriber([&](const Message& m) { latency_ns = now_ns() - m.publish_timestamp_ns; }), ErrorCode::OK);
+  auto bus = make_bus(name, config);
+  ASSERT_TRUE(bus->add_subscriber([&](const Message& m) { latency_ns = now_ns() - m.publish_timestamp_ns; }));
   std::this_thread::sleep_for(100ms);
 
   for (int i = 0; i < 20; ++i) {
     latency_ns = -1;
-    ASSERT_EQ(bus->publish(as_bytes("wake up")), ErrorCode::OK);
+    ASSERT_TRUE(bus->publish(as_bytes("wake up")));
     ASSERT_TRUE(wait_until([&] { return latency_ns >= 0; }, 1000ms));
     // Must be a futex wake, not the 50ms safety-net timeout
     EXPECT_LT(latency_ns.load(), 20'000'000) << "iteration " << i;
@@ -385,12 +384,12 @@ TEST(Bus, SleepingSubscriberIsWokenByPublish) {
 TEST(CrossProcess, PublishFromAnotherProcess) {
   ScopedBusName name;
   std::atomic_uint64_t received{0}, bad{0};
-  auto bus = create_bus(name, test_config(BackPressureMode::RELIABLE, 64, 256));
-  ASSERT_EQ(bus->add_subscriber([&](const Message& m) {
+  auto bus = make_bus(name, test_config(BackPressureMode::RELIABLE, 64, 256));
+  ASSERT_TRUE(bus->add_subscriber([&](const Message& m) {
     const auto info = check_payload(m.data);
     if (!info.valid || info.producer != 99 || info.counter != received) ++bad;
     ++received;
-  }), ErrorCode::OK);
+  }));
 
   const pid_t child = spawn_helper({"publish", name.str(), "64", "256", "20000"});
   const int status = wait_for_exit(child);
@@ -403,7 +402,7 @@ TEST(CrossProcess, PublishFromAnotherProcess) {
 TEST(CrossProcess, CrashedSubscriberDoesNotBlockReliablePublishers) {
   ScopedBusName name;
   const Config config = test_config(BackPressureMode::RELIABLE, 16, 64);
-  auto bus = create_bus(name, config);
+  auto bus = make_bus(name, config);
 
   const pid_t child = spawn_helper({"subscribe-and-crash", name.str(), "16", "64"});
   const int status = wait_for_exit(child);
@@ -413,7 +412,7 @@ TEST(CrossProcess, CrashedSubscriberDoesNotBlockReliablePublishers) {
   // process is gone and reclaim it instead of blocking forever.
   const auto start = std::chrono::steady_clock::now();
   for (int i = 0; i < 64; ++i) {
-    ASSERT_EQ(bus->publish(as_bytes("still flowing"), 2'000'000), ErrorCode::OK) << i;
+    ASSERT_TRUE(bus->publish(as_bytes("still flowing"), 2'000'000)) << i;
   }
   EXPECT_LT(std::chrono::steady_clock::now() - start, 1s);
 }
