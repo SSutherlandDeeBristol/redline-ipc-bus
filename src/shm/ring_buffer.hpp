@@ -13,7 +13,8 @@ public:
     OK,          // message copied out intact
     NOT_READY,   // not published yet, or still being written
     OVERWRITTEN, // a later lap has (or is about to have) replaced this message
-    SKIPPED      // the producer aborted this sequence, so there is no message to deliver
+    SKIPPED,     // the producer aborted this sequence, so there is no message to deliver
+    LOST         // the producer died before committing this sequence, so its message is lost
   };
 
   explicit RingBuffer(std::shared_ptr<SegmentMapping> segment);
@@ -27,9 +28,29 @@ public:
   // `seq` and returns where its payload goes (slot_size_bytes long), or nullptr if a later lap has already claimed it.
   // Subscribers see `seq` as not ready until it is committed or aborted, which must follow.
   uint8_t* begin_write(uint64_t seq) noexcept;
+
+  // begin_write without waiting: `payload` is null if a later lap already has the slot (`lapped`) or an older lap is
+  // still writing it (`busy_with` is that lap's sequence)
+  struct Begin {
+    uint8_t* payload;
+    bool lapped;
+    uint64_t busy_with;
+  };
+  Begin try_begin_write(uint64_t seq) noexcept;
   void commit(uint64_t seq, uint32_t size, int64_t timestamp_ns) noexcept;
+  // Copies `data` into the payload begin_write returned for `seq`, and commits it
+  void fill_and_commit(uint64_t seq, uint8_t* payload, const std::span<const uint8_t>& data, int64_t timestamp_ns) noexcept;
   // Commits `seq` as a gap that subscribers skip
   void abort(uint64_t seq, int64_t timestamp_ns) noexcept { commit(seq, ABORTED_SIZE, timestamp_ns); }
+
+  // Recovery only: the caller holds the recovery lock and knows `seq`'s publisher is dead. Commits `seq` as lost so
+  // subscribers and later laps can get past it, whether or not its publisher had started writing.
+  enum class FinishResult {
+    FINISHED,
+    NOTHING_TO_DO, // already committed, or overwritten by a later lap
+    OLDER_LAP_BUSY // an older lap's publisher is still in the slot (its sequence is put in `older`)
+  };
+  FinishResult finish_lost(uint64_t seq, int64_t timestamp_ns, uint64_t& older) noexcept;
 
   struct ReadOutcome {
     ReadResult result;

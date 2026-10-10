@@ -69,8 +69,8 @@ class BusImpl;
 namespace detail {
 class ClaimOwner {
 public:
-  virtual void commit_claim(uint64_t sequence, uint32_t size) noexcept = 0;
-  virtual void abort_claim(uint64_t sequence) noexcept = 0;
+  virtual void commit_claim(uint64_t sequence, uint32_t size, void* context) noexcept = 0;
+  virtual void abort_claim(uint64_t sequence, void* context) noexcept = 0;
 
 protected:
   ~ClaimOwner() = default;
@@ -111,12 +111,13 @@ public:
 
 private:
   friend class BusImpl;
-  Claim(detail::ClaimOwner* owner, uint64_t sequence, std::span<uint8_t> data) noexcept
-      : owner_(owner), sequence_(sequence), data_(data) {}
+  Claim(detail::ClaimOwner* owner, uint64_t sequence, std::span<uint8_t> data, void* context) noexcept
+      : owner_(owner), sequence_(sequence), data_(data), context_(context) {}
 
   detail::ClaimOwner* owner_ = nullptr;
   uint64_t sequence_ = 0;
   std::span<uint8_t> data_;
+  void* context_ = nullptr;
 };
 
 class Bus {

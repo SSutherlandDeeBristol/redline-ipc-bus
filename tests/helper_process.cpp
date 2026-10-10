@@ -1,9 +1,11 @@
 // Child process used by the cross-process tests:
 //   helper publish <bus> <bus_size> <msg_size> <count>      publish <count> self-validating messages (RELIABLE)
 //   helper subscribe-and-crash <bus> <bus_size> <msg_size>  register a subscriber, then die from SIGKILL
+//   helper claim-and-crash <bus> <bus_size> <msg_size>      claim a slot, write half a message, then die from SIGKILL
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 
 #include "redline/bus.hpp"
@@ -35,6 +37,13 @@ int main(int argc, char** argv) {
       }
     }
     return 0;
+  }
+
+  if (mode == "claim-and-crash") {
+    Claim claim;
+    if (bus->claim(claim) != ErrorCode::OK) return 1;
+    std::memset(claim.data().data(), 0x5A, claim.data().size() / 2);
+    std::raise(SIGKILL);
   }
 
   if (mode == "subscribe-and-crash") {

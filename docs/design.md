@@ -7,11 +7,11 @@ How a bus works inside. None of this is needed to use Redline, but it explains i
 A bus is one shared memory segment, `/dev/shm/redline.<name>`, laid out as:
 
 ```
-+--------------------+----------------------------------+------------------------------------+
-| header             | subscriber registry              | slots                              |
-| sizes, write_seq,  | max_subscribers x 128 B entries  | bus_size x (32 B header + payload, |
-| wakeup counters    |                                  | rounded up to 64 B)                |
-+--------------------+----------------------------------+------------------------------------+
++--------------------+---------------------------+---------------------------+------------------------------------+
+| header             | subscriber registry       | publisher registry        | slots                              |
+| sizes, write_seq,  | max_subscribers x 128 B   | max_publishers x 64 B     | bus_size x (32 B header + payload, |
+| wakeup counters    |                           |                           | rounded up to 64 B)                |
++--------------------+---------------------------+---------------------------+------------------------------------+
 ```
 
 The header records a magic number, a layout version, the struct sizes and the segment-wide config. A process that
@@ -67,17 +67,35 @@ marks itself live again.
 
 ## Liveness
 
-A registry entry is claimed by taking an open file description lock (`F_OFD_SETLK`) on byte `i` of the segment,
-through a file descriptor of the subscriber's own, and then compare-and-swapping the entry from `EMPTY`. The kernel
+A registry entry is claimed by taking an open file description lock (`F_OFD_SETLK`) on one byte of the segment file,
+through a file descriptor of the owner's own, and then compare-and-swapping the entry from `EMPTY`. The kernel
 releases the lock when the last descriptor for it closes, which includes the process dying. Any process can test
-whether an entry's lock is held; when a publisher is blocked, or the registry is full, entries whose lock is free are
-reclaimed.
+whether an entry's lock is held. Subscribers and publishers lock different byte ranges.
 
 Unlike checking pids, this works across pid namespaces. Unlike robust mutexes, the lock belongs to a file description
-rather than a thread, so a subscription can be polled from any thread.
+rather than a thread, so a subscription can be polled from, and a claim committed from, any thread.
+
+Dead subscribers are reclaimed when a publisher is blocked or the subscriber registry is full.
+
+## Recovering from dead publishers
+
+Each publish in progress, and each open claim, holds a publisher registry entry. Before its reservation
+compare-and-swap, a publisher writes the range it is about to reserve into its entry, and it clears the record only
+after committing everything in it. So any sequence below `write_seq` that isn't committed is covered by its owner's
+record.
+
+When a subscriber has waited on a reserved sequence for a millisecond, or a publisher has waited that long for an
+older lap's publisher to leave a slot, it runs recovery. Recovery looks at entries whose lock is free (dead
+publishers) and, for each sequence in their records, finishes it as lost unless a live publisher's record also covers
+it. A sequence covered only by dead records, and already reserved, can only belong to a dead publisher, and nobody can
+reserve it again, so finishing it can't interfere with anyone. Only one process recovers at a time, under another
+byte lock, because finishing a slot the dead publisher had claimed takes several stores.
+
+Taking a lease and writing the record cost about 10 ns per publish.
 
 ## Costs
 
+- Crash safety for publishers adds about 10 ns to each publish.
 - One cache line moves between a publisher and a subscriber that has caught up, for every message. A single producer
   with a subscriber that keeps up manages about 4M messages/s; batching amortises this.
 - Copy mode copies each message twice. Claims and zero-copy reads remove both copies.

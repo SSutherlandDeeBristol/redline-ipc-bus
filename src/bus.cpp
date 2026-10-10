@@ -1,6 +1,7 @@
 #include "redline/bus.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -22,6 +23,7 @@
 #include "histogram.hpp"
 #include "shm/futex.hpp"
 #include "shm/layout.hpp"
+#include "shm/publisher_registry.hpp"
 #include "shm/ring_buffer.hpp"
 #include "shm/segment.hpp"
 #include "shm/subscriber_registry.hpp"
@@ -34,6 +36,9 @@ constexpr int64_t REAP_INTERVAL_NS = 100'000'000;
 constexpr uint32_t SPINS_BEFORE_YIELD = 1024;
 constexpr uint32_t SPINS_PER_SCAN = 16; // how often a producer waiting for space re-reads subscribers' positions
 constexpr size_t POLL_BATCH = 256; // messages a poll thread delivers between checks for shutdown
+// How long a reserved sequence can stay unfinished before a waiting subscriber or publisher checks whether its
+// publisher has died. Recovery never touches a live publisher's sequence, so this only bounds how often we look.
+constexpr int64_t STALL_RECOVERY_NS = 1'000'000;
 
 std::string segment_name(const std::string& name) {
   if (name.empty() || name.find('/') != std::string::npos || name.size() > 200) {
@@ -67,6 +72,7 @@ public:
       : mapping_(std::move(mapping)),
         segment_(mapping_->segment()),
         ring_buffer_(mapping_),
+        publisher_registry_(mapping_),
         lease_(std::move(lease)),
         entry_(lease_->entry()),
         name_(mapping_->name()),
@@ -130,14 +136,20 @@ public:
       const auto outcome = zero_copy_ ? ring_buffer_.peek(seq, data) : ring_buffer_.read(seq, buffer_.data());
 
       if (outcome.result == shm::RingBuffer::ReadResult::NOT_READY) {
+        check_stalled(now_benchmark_ns());
         break;
       }
+      stalled_since_ns_ = 0;
       if (outcome.result == shm::RingBuffer::ReadResult::OVERWRITTEN) {
         skip_overwritten();
         continue;
       }
-      if (outcome.result == shm::RingBuffer::ReadResult::SKIPPED) {
-        // An aborted claim: nothing was published under this sequence, so it is neither delivered nor dropped
+      if (outcome.result == shm::RingBuffer::ReadResult::SKIPPED || outcome.result == shm::RingBuffer::ReadResult::LOST) {
+        // SKIPPED is an aborted claim: nothing was published, so it is neither delivered nor dropped. LOST is a
+        // message whose publisher died before committing it.
+        if (outcome.result == shm::RingBuffer::ReadResult::LOST) {
+          add_dropped(1);
+        }
         read_seq_ = seq + 1;
         entry_.read_seq.store(seq + 1, std::memory_order_release);
         continue;
@@ -187,6 +199,7 @@ public:
       if (now >= deadline_ns) {
         return false;
       }
+      check_stalled(now);
       if (now - start_ns < spin_duration_ns_) {
         cpu_relax();
         continue;
@@ -200,6 +213,7 @@ private:
   std::shared_ptr<shm::SegmentMapping> mapping_;
   shm::SHMSegment* segment_;
   shm::RingBuffer ring_buffer_;
+  shm::PublisherRegistry publisher_registry_;
   std::unique_ptr<shm::SubscriberLease> lease_;
   shm::SubscriberEntry& entry_;
   std::string name_;
@@ -212,11 +226,29 @@ private:
   // Only touched by the polling thread
   uint64_t read_seq_;
   int64_t last_heartbeat_ns_;
+  int64_t stalled_since_ns_ = 0; // when we first found nothing to read at read_seq_, 0 while messages are flowing
   std::vector<uint8_t> buffer_; // copy mode: messages are copied here before being handed to callbacks
 
   bool ready() const noexcept {
     return entry_.state.load(std::memory_order_relaxed) != uint32_t(shm::SubscriberState::OK) ||
            ring_buffer_.is_ready(read_seq_);
+  }
+
+  // Called while read_seq_ isn't ready. If it has been reserved but stayed unfinished for a while, its publisher may
+  // have died mid-publish, so ask for recovery (which leaves it alone if its publisher is alive).
+  void check_stalled(const int64_t now) noexcept {
+    if (stalled_since_ns_ == 0) {
+      stalled_since_ns_ = now;
+      return;
+    }
+    if (now - stalled_since_ns_ < STALL_RECOVERY_NS) {
+      return;
+    }
+    stalled_since_ns_ = now;
+    // Beyond write_seq we are just waiting for new messages; only checked occasionally, since publishers write it constantly
+    if (read_seq_ < segment_->write_seq.load(std::memory_order_seq_cst)) {
+      publisher_registry_.recover();
+    }
   }
 
   void heartbeat(const int64_t now) noexcept {
@@ -301,6 +333,7 @@ public:
     slot_count_ = segment_->slot_count;
     ring_buffer_ = std::make_unique<shm::RingBuffer>(segment_mapping_);
     subscriber_registry_ = std::make_unique<shm::SubscriberRegistry>(segment_mapping_);
+    publisher_registry_ = std::make_unique<shm::PublisherRegistry>(segment_mapping_);
   }
 
   ErrorCode publish(const std::span<const uint8_t>& data, const int64_t timeout_us) override {
@@ -318,33 +351,51 @@ public:
       return ErrorCode::OK;
     }
 
-    const int64_t timestamp_ns = now_ns();
-
     if (count > slot_count_) {
       return ErrorCode::INVALID_ARGUMENT;
     }
+
+    ErrorCode error = ErrorCode::OK;
+    PublisherSlot* publisher = acquire_publisher(error);
+    if (!publisher) {
+      return error;
+    }
+
+    const int64_t timestamp_ns = now_ns();
     uint64_t first_seq;
-    if (!reserve(count, timeout_us, first_seq)) {
+    if (!reserve(count, timeout_us, first_seq, *publisher->lease)) {
+      release_publisher(publisher);
       return ErrorCode::BACKPRESSURE_TIMEOUT;
     }
 
-    // A false return means a later lap already took the slot, which subscribers will account for as a drop
+    // No payload means a later lap already took the slot, which subscribers will account for as a drop
     for (uint64_t i = 0; i < count; ++i) {
-      ring_buffer_->write(first_seq + i, messages[i], timestamp_ns);
+      if (uint8_t* payload = begin_slot(first_seq + i)) {
+        ring_buffer_->fill_and_commit(first_seq + i, payload, messages[i], timestamp_ns);
+      }
     }
+    publisher->lease->done();
+    release_publisher(publisher);
     wake_if_sleeping();
     return ErrorCode::OK;
   }
 
   ErrorCode claim(Claim& claim, const int64_t timeout_us) override {
     claim.abort();
+    // The claim keeps the publisher lease until it is committed or aborted, so its record covers the open sequence
+    ErrorCode error = ErrorCode::OK;
+    PublisherSlot* publisher = acquire_publisher(error);
+    if (!publisher) {
+      return error;
+    }
     while (true) {
       uint64_t seq;
-      if (!reserve(1, timeout_us, seq)) {
+      if (!reserve(1, timeout_us, seq, *publisher->lease)) {
+        release_publisher(publisher);
         return ErrorCode::BACKPRESSURE_TIMEOUT;
       }
-      if (uint8_t* data = ring_buffer_->begin_write(seq)) {
-        claim = Claim(this, seq, std::span<uint8_t>(data, segment_->slot_size_bytes));
+      if (uint8_t* data = begin_slot(seq)) {
+        claim = Claim(this, seq, std::span<uint8_t>(data, segment_->slot_size_bytes), publisher);
         return ErrorCode::OK;
       }
       // Producers lapped each other and a later lap already took this slot, so this sequence is lost to subscribers
@@ -439,14 +490,104 @@ public:
   }
 
 private:
-  void commit_claim(const uint64_t sequence, const uint32_t size) noexcept override {
+  // A publisher lease, and whether a publish or Claim in this process is using it. Each in-flight publish needs a lease
+  // of its own (a lease records one reservation at a time), so they are created as needed and kept until the Bus is
+  // destroyed: their number tracks the most publishes this Bus ever had in flight at once.
+  struct alignas(shm::CACHE_LINE_SIZE) PublisherSlot {
+    std::atomic_bool in_use{false};
+    std::unique_ptr<shm::PublisherLease> lease; // set before the slot is counted, never changed after
+  };
+  static constexpr size_t PUBLISHER_SLOTS_PER_CHUNK = 64;
+  static constexpr size_t MAX_PUBLISHER_CHUNKS = shm::MAX_REGISTRY_ENTRIES / PUBLISHER_SLOTS_PER_CHUNK;
+  struct PublisherSlotChunk {
+    std::array<PublisherSlot, PUBLISHER_SLOTS_PER_CHUNK> slots;
+  };
+
+  void commit_claim(const uint64_t sequence, const uint32_t size, void* context) noexcept override {
     ring_buffer_->commit(sequence, size, now_ns());
+    finish_claim(static_cast<PublisherSlot*>(context));
+  }
+
+  void abort_claim(const uint64_t sequence, void* context) noexcept override {
+    ring_buffer_->abort(sequence, now_ns());
+    finish_claim(static_cast<PublisherSlot*>(context)); // subscribers waiting on this sequence can move past it
+  }
+
+  void finish_claim(PublisherSlot* publisher) noexcept {
+    publisher->lease->done();
+    release_publisher(publisher);
     wake_if_sleeping();
   }
 
-  void abort_claim(const uint64_t sequence) noexcept override {
-    ring_buffer_->abort(sequence, now_ns());
-    wake_if_sleeping(); // subscribers waiting on this sequence can move past it
+  // Claims seq's slot. If an older lap's publisher is still writing it, waits, and if that goes on for a while checks
+  // whether it has died. Returns null if a later lap already took the slot.
+  uint8_t* begin_slot(const uint64_t seq) noexcept {
+    int64_t waiting_since_ns = 0;
+    while (true) {
+      const auto begin = ring_buffer_->try_begin_write(seq);
+      if (begin.payload || begin.lapped) {
+        return begin.payload;
+      }
+      const int64_t now = now_benchmark_ns();
+      if (waiting_since_ns == 0) {
+        waiting_since_ns = now;
+      } else if (now - waiting_since_ns > STALL_RECOVERY_NS) {
+        publisher_registry_->recover();
+        waiting_since_ns = now;
+      }
+      cpu_relax();
+    }
+  }
+
+  PublisherSlot& publisher_slot(const size_t i) noexcept {
+    return publisher_chunks_[i / PUBLISHER_SLOTS_PER_CHUNK].load(std::memory_order_acquire)->slots[i % PUBLISHER_SLOTS_PER_CHUNK];
+  }
+
+  PublisherSlot* acquire_publisher(ErrorCode& error) {
+    thread_local size_t hint = 0; // where this thread last found a free slot, so threads tend to keep to their own
+    const size_t count = publisher_slot_count_.load(std::memory_order_acquire);
+    for (size_t k = 0; k < count; ++k) {
+      const size_t i = (hint + k) % count;
+      PublisherSlot& slot = publisher_slot(i);
+      if (!slot.in_use.load(std::memory_order_relaxed) && !slot.in_use.exchange(true, std::memory_order_acquire)) {
+        hint = i;
+        return &slot;
+      }
+    }
+
+    // All busy: register another lease
+    std::lock_guard lk(publisher_slots_mutex_);
+    const size_t n = publisher_slot_count_.load(std::memory_order_relaxed);
+    if (n == MAX_PUBLISHER_CHUNKS * PUBLISHER_SLOTS_PER_CHUNK) {
+      error = ErrorCode::PUBLISHER_REGISTRY_FULL;
+      return nullptr;
+    }
+    std::unique_ptr<shm::PublisherLease> lease;
+    try {
+      lease = publisher_registry_->register_publisher();
+    } catch (const std::exception& e) {
+      REDLINE_LOG(ERROR) << "Failed to register publisher on " << name_ << ": " << e.what();
+      error = ErrorCode::UNKNOWN_ERROR;
+      return nullptr;
+    }
+    if (!lease) {
+      error = ErrorCode::PUBLISHER_REGISTRY_FULL;
+      return nullptr;
+    }
+    if (n % PUBLISHER_SLOTS_PER_CHUNK == 0) {
+      publisher_chunk_storage_.push_back(std::make_unique<PublisherSlotChunk>());
+      publisher_chunks_[n / PUBLISHER_SLOTS_PER_CHUNK].store(publisher_chunk_storage_.back().get(), std::memory_order_release);
+    }
+    PublisherSlot& slot = publisher_slot(n);
+    slot.lease = std::move(lease);
+    slot.in_use.store(true, std::memory_order_relaxed);
+    publisher_slot_count_.store(n + 1, std::memory_order_release);
+    hint = n;
+    return &slot;
+  }
+
+  static void release_publisher(PublisherSlot* publisher) noexcept {
+    publisher->in_use.store(false, std::memory_order_release);
   }
 
   // Only pay for a syscall when a subscriber is actually asleep. The fence pairs with the one in sleep_until_ready:
@@ -472,6 +613,12 @@ private:
 
   std::unique_ptr<shm::RingBuffer> ring_buffer_;
   std::unique_ptr<shm::SubscriberRegistry> subscriber_registry_;
+  std::unique_ptr<shm::PublisherRegistry> publisher_registry_;
+
+  std::array<std::atomic<PublisherSlotChunk*>, MAX_PUBLISHER_CHUNKS> publisher_chunks_{};
+  std::atomic_size_t publisher_slot_count_ = 0;
+  std::mutex publisher_slots_mutex_;
+  std::vector<std::unique_ptr<PublisherSlotChunk>> publisher_chunk_storage_; // guarded by publisher_slots_mutex_
 
   // Shared by the callbacks on poll_thread_. Created with the first callback and kept until the Bus is destroyed.
   std::unique_ptr<SubscriptionImpl> shared_subscription_;
@@ -539,7 +686,8 @@ private:
   // Reserves `count` consecutive sequences once every live RELIABLE subscriber has consumed the messages currently in
   // their slots (immediately, if there are none). The compare-exchange makes the capacity check and the reservation one
   // step, so concurrent producers can't overrun a subscriber between them.
-  bool reserve(const uint64_t count, const int64_t timeout_us, uint64_t& first_seq) {
+  // The lease records each attempt before it is made, so recovery can tell whose sequences are whose.
+  bool reserve(const uint64_t count, const int64_t timeout_us, uint64_t& first_seq, shm::PublisherLease& lease) {
     uint64_t write_seq = segment_->write_seq.load(std::memory_order_seq_cst);
     int64_t start_us = -1;
     uint32_t spins = 0;
@@ -563,6 +711,7 @@ private:
           if (start_us < 0) {
             start_us = now_benchmark_us();
           } else if (timeout_us >= 0 && now_benchmark_us() - start_us >= timeout_us) {
+            lease.done();
             return false;
           }
 
@@ -576,6 +725,7 @@ private:
         }
       }
 
+      lease.reserving(write_seq, count);
       if (segment_->write_seq.compare_exchange_weak(write_seq, write_seq + count, std::memory_order_seq_cst)) {
         first_seq = write_seq;
         return true;
@@ -589,7 +739,8 @@ private:
     return write_seq < min_read_seq || write_seq + count - min_read_seq <= slot_count_;
   }
 
-  // Checks for subscribers that have died or (if configured) stalled, at most every REAP_INTERVAL_NS per process
+  // Checks for subscribers that have died or (if configured) stalled, and for publishers that died mid-publish leaving
+  // subscribers stuck, at most every REAP_INTERVAL_NS per process
   void maybe_reap() noexcept {
     const int64_t now = now_ns();
     int64_t last = last_reap_ns_.load(std::memory_order_relaxed);
@@ -599,6 +750,7 @@ private:
     if (subscriber_registry_->reap(now, config_.subscriber_timeout_us * 1000) > 0) {
       cached_min_read_seq_.store(0, std::memory_order_release); // force a rescan
     }
+    publisher_registry_->recover();
   }
 
   void run_shared() {
@@ -619,7 +771,8 @@ private:
 };
 
 Claim::Claim(Claim&& other) noexcept
-    : owner_(std::exchange(other.owner_, nullptr)), sequence_(other.sequence_), data_(std::exchange(other.data_, {})) {}
+    : owner_(std::exchange(other.owner_, nullptr)), sequence_(other.sequence_), data_(std::exchange(other.data_, {})),
+      context_(std::exchange(other.context_, nullptr)) {}
 
 Claim& Claim::operator=(Claim&& other) noexcept {
   if (this != &other) {
@@ -627,6 +780,7 @@ Claim& Claim::operator=(Claim&& other) noexcept {
     owner_ = std::exchange(other.owner_, nullptr);
     sequence_ = other.sequence_;
     data_ = std::exchange(other.data_, {});
+    context_ = std::exchange(other.context_, nullptr);
   }
   return *this;
 }
@@ -642,14 +796,14 @@ ErrorCode Claim::commit(const size_t size) noexcept {
   if (size > data_.size()) {
     return ErrorCode::MESSAGE_TOO_LARGE;
   }
-  std::exchange(owner_, nullptr)->commit_claim(sequence_, uint32_t(size));
+  std::exchange(owner_, nullptr)->commit_claim(sequence_, uint32_t(size), std::exchange(context_, nullptr));
   data_ = {};
   return ErrorCode::OK;
 }
 
 void Claim::abort() noexcept {
   if (owner_) {
-    std::exchange(owner_, nullptr)->abort_claim(sequence_);
+    std::exchange(owner_, nullptr)->abort_claim(sequence_, std::exchange(context_, nullptr));
     data_ = {};
   }
 }

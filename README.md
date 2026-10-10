@@ -16,7 +16,8 @@ shared segment.
 - Low latency: about 1.1 µs for a ping-pong round trip. Publishing makes no system calls unless a subscriber is asleep.
 - Each subscriber chooses reliable or lossy delivery. Lossy subscribers never slow publishers down.
 - Zero-copy in both directions: build messages in place with `claim()`, read them in place with `zero_copy_reads`.
-- Subscribers in crashed processes are cleaned up automatically, including in other containers sharing `/dev/shm`.
+- Survives crashed processes: dead subscribers stop holding publishers back, and messages left half-written by dead
+  publishers are skipped. This works across containers sharing `/dev/shm`.
 - Lag, drop counts and latency percentiles for every subscriber.
 - Callbacks on a background thread, or a `Subscription` polled from your own loop.
 - No runtime dependencies.
@@ -95,7 +96,7 @@ AMD Ryzen 5 3600 (6 cores), Linux 6.8, GCC 13.3, Release build:
 
 | | |
 |---|---|
-| Publish, no subscribers, 16 B | 37 ns |
+| Publish, no subscribers, 16 B | 47 ns |
 | One publisher and subscriber, 16 B | 4.0M msg/s |
 | Same, `publish_batch` of 16 | 22M msg/s |
 | 4 to 8 publishers, one subscriber, 64 B | 12M to 20M msg/s, varying between runs |
@@ -118,8 +119,7 @@ no moving parts.
 ## Status
 
 Redline is young and its API may change before 1.0. The shared-memory layout is versioned, and a process refuses to
-open a bus created by an incompatible version. A publisher that crashes in the middle of writing a message stalls the
-bus until it is recreated; see [semantics](docs/semantics.md#guarantees).
+open a bus created by an incompatible version.
 
 ## Contributing
 

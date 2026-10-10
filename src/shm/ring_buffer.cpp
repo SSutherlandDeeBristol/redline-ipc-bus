@@ -27,12 +27,27 @@ bool RingBuffer::write(const uint64_t seq, const std::span<const uint8_t>& data,
   if (!payload) {
     return false;
   }
-  seqlock_copy_to_slot(payload, data.data(), data.size());
-  commit(seq, uint32_t(data.size()), timestamp_ns);
+  fill_and_commit(seq, payload, data, timestamp_ns);
   return true;
 }
 
+void RingBuffer::fill_and_commit(const uint64_t seq, uint8_t* payload, const std::span<const uint8_t>& data,
+                                 const int64_t timestamp_ns) noexcept {
+  seqlock_copy_to_slot(payload, data.data(), data.size());
+  commit(seq, uint32_t(data.size()), timestamp_ns);
+}
+
 uint8_t* RingBuffer::begin_write(const uint64_t seq) noexcept {
+  while (true) {
+    const Begin begin = try_begin_write(seq);
+    if (begin.payload || begin.lapped) {
+      return begin.payload;
+    }
+    cpu_relax(); // an older lap is still writing this slot
+  }
+}
+
+RingBuffer::Begin RingBuffer::try_begin_write(const uint64_t seq) noexcept {
   SlotHeader* header = segment_->header_at(seq);
 
   // Claim the slot by moving its version to odd. Only one producer can do this at a time, so two producers a lap
@@ -40,13 +55,10 @@ uint8_t* RingBuffer::begin_write(const uint64_t seq) noexcept {
   uint64_t version = header->version.load(std::memory_order_relaxed);
   while (true) {
     if (version >= writing_version(seq)) {
-      return nullptr; // a later lap got here first
+      return {nullptr, true, 0}; // a later lap got here first
     }
     if (version & 1) {
-      // An older lap is still writing this slot
-      cpu_relax();
-      version = header->version.load(std::memory_order_relaxed);
-      continue;
+      return {nullptr, false, (version - 1) / 2}; // an older lap is still writing this slot
     }
     if (header->version.compare_exchange_weak(version, writing_version(seq), std::memory_order_relaxed)) {
       break;
@@ -54,7 +66,33 @@ uint8_t* RingBuffer::begin_write(const uint64_t seq) noexcept {
   }
   // Keep the payload writes that follow from becoming visible before the odd version
   std::atomic_thread_fence(std::memory_order_release);
-  return segment_->payload_at(seq);
+  return {segment_->payload_at(seq), false, 0};
+}
+
+RingBuffer::FinishResult RingBuffer::finish_lost(const uint64_t seq, const int64_t timestamp_ns, uint64_t& older) noexcept {
+  SlotHeader* header = segment_->header_at(seq);
+  uint64_t version = header->version.load(std::memory_order_acquire);
+  while (true) {
+    if (version >= committed_version(seq)) {
+      return FinishResult::NOTHING_TO_DO;
+    }
+    if (version == writing_version(seq)) {
+      // The dead publisher got as far as claiming the slot. Nobody else can write it while it is odd, and the
+      // recovery lock keeps other recoverers out, so finish it as the publisher would have.
+      break;
+    }
+    if (version & 1) {
+      older = (version - 1) / 2;
+      return FinishResult::OLDER_LAP_BUSY;
+    }
+    // Not claimed yet: claim it ourselves. A publisher lapping us may beat us to it, in which case the sequence is
+    // already gone and subscribers count it as overwritten.
+    if (header->version.compare_exchange_weak(version, writing_version(seq), std::memory_order_acquire)) {
+      break;
+    }
+  }
+  commit(seq, LOST_SIZE, timestamp_ns);
+  return FinishResult::FINISHED;
 }
 
 void RingBuffer::commit(const uint64_t seq, const uint32_t size, const int64_t timestamp_ns) noexcept {
@@ -79,7 +117,8 @@ RingBuffer::ReadOutcome RingBuffer::read(const uint64_t seq, uint8_t* out) const
   // throws away anything read during an overlap.
   const uint32_t raw_size = header->size.load(std::memory_order_relaxed);
   const bool aborted = raw_size == ABORTED_SIZE;
-  const uint32_t size = aborted ? 0 : std::min(raw_size, slot_size_bytes_);
+  const bool lost = raw_size == LOST_SIZE;
+  const uint32_t size = aborted || lost ? 0 : std::min(raw_size, slot_size_bytes_);
   const int64_t timestamp_ns = header->publish_timestamp_ns.load(std::memory_order_relaxed);
   seqlock_copy_from_slot(out, segment_->payload_at(seq), size);
 
@@ -88,7 +127,7 @@ RingBuffer::ReadOutcome RingBuffer::read(const uint64_t seq, uint8_t* out) const
     return {ReadResult::OVERWRITTEN, 0, 0};
   }
 
-  return {aborted ? ReadResult::SKIPPED : ReadResult::OK, size, timestamp_ns};
+  return {aborted ? ReadResult::SKIPPED : lost ? ReadResult::LOST : ReadResult::OK, size, timestamp_ns};
 }
 
 RingBuffer::ReadOutcome RingBuffer::peek(const uint64_t seq, const uint8_t*& data) const noexcept {
@@ -104,8 +143,8 @@ RingBuffer::ReadOutcome RingBuffer::peek(const uint64_t seq, const uint8_t*& dat
   }
 
   const uint32_t size = header->size.load(std::memory_order_relaxed);
-  if (size == ABORTED_SIZE) {
-    return {ReadResult::SKIPPED, 0, 0};
+  if (size == ABORTED_SIZE || size == LOST_SIZE) {
+    return {size == ABORTED_SIZE ? ReadResult::SKIPPED : ReadResult::LOST, 0, 0};
   }
   data = segment_->payload_at(seq);
   return {ReadResult::OK, std::min(size, slot_size_bytes_), header->publish_timestamp_ns.load(std::memory_order_relaxed)};

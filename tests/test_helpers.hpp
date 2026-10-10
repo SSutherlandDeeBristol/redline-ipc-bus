@@ -11,12 +11,16 @@
 #include <span>
 #include <string>
 #include <thread>
+#include <spawn.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
 
 #include <gtest/gtest.h>
 
 #include "redline/bus.hpp"
+
+extern char** environ;
 
 namespace redline::test {
 
@@ -149,5 +153,26 @@ private:
   std::mutex mutex_;
   std::vector<uint64_t> values_;
 };
+
+#ifdef REDLINE_TEST_HELPER
+// Runs tests/helper_process.cpp with the given arguments
+inline pid_t spawn_helper(const std::vector<std::string>& args) {
+  std::vector<char*> argv;
+  std::string path = REDLINE_TEST_HELPER;
+  argv.push_back(path.data());
+  std::vector<std::string> copy = args;
+  for (auto& a : copy) argv.push_back(a.data());
+  argv.push_back(nullptr);
+  pid_t pid = -1;
+  EXPECT_EQ(posix_spawn(&pid, path.c_str(), nullptr, nullptr, argv.data(), environ), 0);
+  return pid;
+}
+
+inline int wait_for_exit(pid_t pid) {
+  int status = 0;
+  waitpid(pid, &status, 0);
+  return status;
+}
+#endif
 
 }

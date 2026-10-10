@@ -37,6 +37,8 @@ public:
 
   uint32_t subscriber_count() const noexcept { return subscriber_count_; }
   SubscriberEntry& subscriber(uint32_t index) const noexcept { return subscribers_[index]; }
+  uint32_t publisher_count() const noexcept { return publisher_count_; }
+  PublisherEntry& publisher(uint32_t index) const noexcept { return publishers_[index]; }
 
   SlotHeader* header_at(uint64_t seq) const noexcept {
     return reinterpret_cast<SlotHeader*>(slots_ + (seq & slot_mask_) * slot_stride_);
@@ -60,6 +62,8 @@ private:
   SHMSegment* segment_ = nullptr;
   SubscriberEntry* subscribers_ = nullptr;
   uint32_t subscriber_count_ = 0;
+  PublisherEntry* publishers_ = nullptr;
+  uint32_t publisher_count_ = 0;
   uint8_t* slots_ = nullptr;
   uint64_t slot_mask_ = 0;
   uint64_t slot_stride_ = 0;
