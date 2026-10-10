@@ -177,6 +177,9 @@ TEST(Memory, LockMemory) {
 }
 
 TEST(Memory, LockingMoreThanTheLimitFails) {
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+  GTEST_SKIP() << "the sanitizer runtimes replace mlock with a no-op that succeeds";
+#endif
   ScopedBusName name;
   rlimit limit{};
   ASSERT_EQ(getrlimit(RLIMIT_MEMLOCK, &limit), 0);
