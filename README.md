@@ -1,172 +1,130 @@
 # Redline
 
-Redline is a **high-performance shared-memory message bus** for processes running on the same Linux host.
+[![CI](https://github.com/SSutherlandDeeBristol/redline-ipc-bus/actions/workflows/ci.yml/badge.svg)](https://github.com/SSutherlandDeeBristol/redline-ipc-bus/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)
+![Platform: Linux](https://img.shields.io/badge/platform-Linux-lightgrey.svg)
 
-It is designed for systems that care about **predictable latency**, **bounded memory usage**, and **explicit backpressure**—not infinite buffering or best-effort delivery by accident.
+Shared-memory publish/subscribe for processes on the same Linux host.
 
-Redline uses POSIX shared memory and lock-free data structures to provide microsecond-level pub/sub messaging between processes, without TCP, brokers, or background daemons.
+A bus is a ring buffer in `/dev/shm`. Publishers write each message into it once, and every subscriber reads it from
+there with its own position in the ring. There is no broker or daemon: processes coordinate through atomics in the
+shared segment.
 
-When consumers fall behind, Redline does not silently degrade:
-**slow subscribers are detected, throttled, or kicked**, and overload behavior is always explicit.
+## Features
 
-### Why Redline?
+- Low latency: about 1.1 µs for a ping-pong round trip. Publishing makes no system calls unless a subscriber is asleep.
+- Each subscriber chooses reliable or lossy delivery. Lossy subscribers never slow publishers down.
+- Zero-copy in both directions: build messages in place with `claim()`, read them in place with `zero_copy_reads`.
+- Subscribers in crashed processes are cleaned up automatically, including in other containers sharing `/dev/shm`.
+- Lag, drop counts and latency percentiles for every subscriber.
+- Callbacks on a background thread, or a `Subscription` polled from your own loop.
+- No runtime dependencies.
 
-- 🚀 Shared memory, not sockets
-- ⏱ Predictable p99 latency
-- 🧱 Bounded buffers by design
-- 🛑 Explicit backpressure semantics
-- 🧠 Designed for same-host microservices, ML pipelines, and realtime systems
-
-Redline is not a distributed message broker.
-It is a **local message fabric**—fast, honest, and close to the metal.
-
-## Usage
+## Quick start
 
 ```cpp
+// subscriber.cpp
+#include <redline/bus.hpp>
+#include <chrono>
+#include <iostream>
+#include <thread>
+
+int main() {
+  auto bus = redline::create_bus("example", redline::Config{});
+  bus->add_subscriber([](const redline::Message& m) {
+    std::cout << m.sequence << ": " << m.data_as_string() << std::endl;
+  });
+  std::this_thread::sleep_for(std::chrono::hours(1));
+}
+```
+
+```cpp
+// publisher.cpp
 #include <redline/bus.hpp>
 
-redline::Config config;
-config.backpressure_mode = redline::BackPressureMode::RELIABLE;
-
-auto bus = redline::create_bus("telemetry", config);   // creates or opens /dev/shm/redline.telemetry
-
-bus->add_subscriber([](const redline::Message& m) {
-  // m.data is only valid during this call; copy it if you need it later
-});
-
-std::string_view hello = "hello";
-bus->publish({reinterpret_cast<const uint8_t*>(hello.data()), hello.size()});
-```
-
-Every process attaching to a bus must agree on `max_message_size`, `bus_size` and `max_subscribers`; `create_bus`
-throws if they don't. A bus outlives the processes using it, so call `redline::destroy_bus(name)` to remove it.
-
-### Ways to subscribe
-
-- **`add_subscriber(callback)`**: all callbacks on a `Bus` share one background thread and one position on the bus,
-  so they run one after another for each message.
-- **`add_subscriber(callback, {.own_thread = true})`**: the callback gets its own thread and position, so a slow
-  callback can't hold up the others on the same `Bus`.
-- **`subscribe()`**: returns a `Subscription` you drive yourself, from your own thread or event loop:
-
-```cpp
-auto subscription = bus->subscribe();
-while (running) {
-  if (subscription->wait(std::chrono::milliseconds(10))) {
-    subscription->poll([](const redline::Message& m) { /* ... */ });
-  }
+int main() {
+  auto bus = redline::create_bus("example", redline::Config{});
+  bus->publish("hello");
 }
 ```
 
-Anything a callback captures must outlive the `Bus` (or `Subscription`) it was added to.
+Start the subscriber first: subscribers only receive messages published after they join. Runnable versions are in
+[`examples/`](examples) and build as `redline_subscriber` and `redline_publisher`.
 
-### Publishing in batches
+A bus outlives the processes using it. Remove it with `redline::destroy_bus("example")`.
 
-`publish_batch` reserves room for several messages at once, so they get consecutive sequence numbers and the
-producer contends with other producers once per batch instead of once per message. It is all or nothing.
+## Installation
 
-### Zero-copy publishing
+Requires Linux 3.15 or later, CMake 3.22 and a C++20 compiler. CI uses GCC 13.
 
-`claim` reserves the next slot and hands you its memory, so a message can be serialized straight into shared memory
-(for example with FlatBuffers, Cap'n Proto or SBE) instead of being built elsewhere and copied in:
+With CMake's `FetchContent`:
 
-```cpp
-redline::Claim claim;
-if (bus->claim(claim) == redline::ErrorCode::OK) {
-  size_t size = serialize_into(claim.data());  // up to max_message_size bytes
-  claim.commit(size);                          // a claim that isn't committed is aborted, and subscribers skip it
-}
+```cmake
+include(FetchContent)
+FetchContent_Declare(redline
+  GIT_REPOSITORY https://github.com/SSutherlandDeeBristol/redline-ipc-bus.git
+  GIT_TAG main)  # pin a commit for reproducible builds
+FetchContent_MakeAvailable(redline)
+
+target_link_libraries(your_app PRIVATE redline::redline)
 ```
 
-Messages are delivered in order, so subscribers can't get past an open claim: commit promptly. Combined with
-zero-copy reads, a message is written once and never copied.
-
-### Zero-copy reads
-
-By default subscribers copy each message out of shared memory before running callbacks, so a slow callback never
-holds a slot. With `zero_copy_reads` (in `Config`, or `SubscriberOptions` per subscriber; `RELIABLE` only) callbacks read the slot in
-place and it is released when they return. That saves a copy per message, which matters for large messages, at the
-cost of holding publishers up for as long as callbacks run. Zero-copy subscribers are never evicted by
-`subscriber_timeout_us`, since evicting one mid-callback would let publishers overwrite what it is reading.
-
-### Logging
-
-Redline reports rare events (segments created, subscribers evicted or reclaimed, callbacks throwing) through a
-process-wide hook. By default warnings and errors go to stderr; route them into your own logging with
-`redline::set_log_handler`, or pass an empty handler to silence them.
-
-## Delivery semantics
-
-Each subscriber chooses its own mode, and both kinds can share a bus: for example a lossless consumer alongside
-monitoring tools that must never slow it down. The default comes from `Config::backpressure_mode`; `own_thread`
-callbacks and `subscribe()` can override it with `SubscriberOptions::backpressure_mode`.
-
-| Subscriber mode | `RELIABLE` | `BEST_EFFORT` |
-|---|---|---|
-| Publishers, once it is a full ring behind | wait (up to `timeout_us`, else `BACKPRESSURE_TIMEOUT`) | carry on, overwriting the oldest message |
-| If it is slow | throttles every publisher; optionally evicted after `subscriber_timeout_us` | skips ahead, counts `dropped_messages` |
-| Messages it loses | none, unless evicted (counted as dropped) | those it was lapped on (counted as dropped) |
-
-Publishers only ever wait for `RELIABLE` subscribers; with none on the bus, `publish` never waits.
-
-In both modes:
-
-- A subscriber never sees a corrupted message. Each slot is a seqlock; messages are copied out and validated before
-  the callback runs, and anything overwritten mid-read is discarded and counted as dropped.
-- Messages arrive in sequence order; every sequence is either delivered or counted in `dropped_messages`.
-- A subscriber starts at the newest message when its first callback is added.
-- Subscribers left behind by crashed processes are detected and reclaimed, so they never block `RELIABLE` publishers.
-  Each subscriber holds an open file description lock on its registry entry, which the kernel releases however the
-  process exits, so this also works between containers with separate pid namespaces (as long as they share `/dev/shm`).
-- `publish` is thread-safe. It makes no syscalls unless a subscriber is asleep waiting for messages.
-- `Message::publish_timestamp_ns` uses `CLOCK_MONOTONIC`, which is shared by every process on the host; compare it
-  with `redline::now_ns()`.
-
-## Building
-
-Redline is Linux-only. The library has no dependencies. GoogleTest and Google Benchmark, for tests and benchmarks, come from
-[vcpkg](https://github.com/microsoft/vcpkg):
+Or install it and use `find_package`:
 
 ```sh
-export VCPKG_ROOT=~/vcpkg            # wherever vcpkg is cloned and bootstrapped
-cmake --preset release               # or debug, asan, tsan
-cmake --build --preset release
-ctest --preset release
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+cmake --install build --prefix /usr/local
 ```
 
-Without presets, pass `-DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake` and enable
-`-DREDLINE_BUILD_TESTS=ON` / `-DREDLINE_BUILD_BENCHMARKS=ON` as needed. `-DREDLINE_SANITIZER=address|thread` builds
-everything with ASan+UBSan or TSan.
+```cmake
+find_package(redline CONFIG REQUIRED)
+target_link_libraries(your_app PRIVATE redline::redline)
+```
 
-CI (`.github/workflows/ci.yml`) builds and tests all four presets with warnings as errors.
+## Documentation
 
-ThreadSanitizer needs address space layout randomisation reduced on recent kernels, so run the TSan tests as
-`setarch -R ctest --preset tsan`. `tests/tsan.supp` suppresses only the seqlock payload copies, which race by design.
+- [User guide](docs/guide.md): configuration, publishing, the ways to subscribe, zero-copy, metrics, logging.
+- [Delivery semantics](docs/semantics.md): reliable and lossy delivery, ordering, crash recovery.
+- [Design](docs/design.md): segment layout, the slot seqlock, reservation, wakeups and liveness.
 
-## Benchmarks
+## Performance
 
-`redline_bench_throughput`, `redline_bench_latency` (ping-pong round trip) and `redline_bench_mp` (multiple
-producers). Indicative numbers on a 12-core desktop, Release build:
+AMD Ryzen 5 3600 (6 cores), Linux 6.8, GCC 13.3, Release build:
 
 | | |
 |---|---|
-| Publish, no subscribers, 16 B | ~37 ns |
-| Sustained throughput, 1 producer, 1 subscriber, 16 B | ~4.7M msg/s (`BEST_EFFORT`), ~4M msg/s (`RELIABLE`) |
-| Same, `publish_batch` of 16 | ~18M msg/s (`RELIABLE`) |
-| 4 / 8 producers, 1 subscriber, 64 B, `RELIABLE` | ~16M / ~14M msg/s |
-| Round trip, 16 B | ~1.1 µs |
-| Round trip, 4 KiB | ~2.3 µs, ~1.8 µs with zero-copy reads |
-| Publish to delivery, 4 KiB, claim + zero-copy reads | p50 ~150-260 ns (vs ~1 µs copying both ways) |
+| Publish, no subscribers, 16 B | 37 ns |
+| One publisher and subscriber, 16 B | 4.0M msg/s |
+| Same, `publish_batch` of 16 | 22M msg/s |
+| 4 to 8 publishers, one subscriber, 64 B | 12M to 20M msg/s, varying between runs |
+| Round trip, 16 B | 1.1 µs |
+| Round trip, 4 KiB | 2.4 µs (1.4 µs with zero-copy reads) |
+| Publish to delivery, 4 KiB, claim and zero-copy reads | 260 ns p50, 510 ns p99 |
 
-A single producer with a caught-up subscriber is limited by cache lines bouncing between their cores on every
-message; batching amortises that.
+The round trips run between two threads through two buses, pinned to four cores. The benchmarks are in
+[`benchmarks/`](benchmarks); see [CONTRIBUTING.md](CONTRIBUTING.md#benchmarks) to run them.
 
-## Limits
+## Alternatives
 
-- `max_subscribers` (default 256, up to 65536) registry entries per bus, shared by all processes. A `Bus` with
-  shared-thread callbacks, each `own_thread` callback and each `subscribe()` takes one; there is no limit on how many
-  callbacks share a thread. Each also holds a file descriptor for its liveness lock, so count them against
-  `ulimit -n`.
-- `bus_size` must be a power of two. Each slot takes `max_message_size + 32` bytes, rounded up to a 64-byte cache line.
-- Subscriber liveness locks are inherited across `fork()` (not `exec`), so a subscriber's forked child keeps its
-  registration alive until the child exits.
+- [Aeron](https://github.com/real-logic/aeron) also works over the network, and can archive and replay streams.
+- [iceoryx2](https://github.com/eclipse-iceoryx/iceoryx2) supports more operating systems and languages, and request/response.
+- [ZeroMQ](https://zeromq.org) runs the same code over IPC or TCP, at the cost of a kernel copy per message.
+
+Redline suits C++ services on one Linux host that fan messages out to several readers and want a small library with
+no moving parts.
+
+## Status
+
+Redline is young and its API may change before 1.0. The shared-memory layout is versioned, and a process refuses to
+open a bus created by an incompatible version. A publisher that crashes in the middle of writing a message stalls the
+bus until it is recreated; see [semantics](docs/semantics.md#guarantees).
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for building, testing under sanitizers, and running benchmarks.
+
+## License
+
+[MIT](LICENSE)

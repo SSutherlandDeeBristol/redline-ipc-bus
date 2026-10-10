@@ -14,7 +14,7 @@ endif()
 # Options
 # ----------------------------
 option(REDLINE_BUILD_TESTS      "Build unit/integration tests" OFF)
-option(REDLINE_BUILD_EXAMPLES   "Build examples" ON)
+option(REDLINE_BUILD_EXAMPLES   "Build examples" ${PROJECT_IS_TOP_LEVEL})
 option(REDLINE_BUILD_BENCHMARKS "Build benchmarks" OFF)
 option(REDLINE_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
 set(REDLINE_SANITIZER "" CACHE STRING "Build everything with a sanitizer: address (ASan+UBSan), thread (TSan) or empty for none")
@@ -102,9 +102,11 @@ redline_apply_warnings(redline)
 # Examples
 # ----------------------------
 if(REDLINE_BUILD_EXAMPLES)
-  add_executable(redline_pubsub_basic examples/pubsub_basic.cpp)
-  target_link_libraries(redline_pubsub_basic PRIVATE redline)
-  redline_apply_warnings(redline_pubsub_basic)
+  foreach(example pubsub_basic publisher subscriber)
+    add_executable(redline_${example} examples/${example}.cpp)
+    target_link_libraries(redline_${example} PRIVATE redline)
+    redline_apply_warnings(redline_${example})
+  endforeach()
 endif()
 
 # ----------------------------

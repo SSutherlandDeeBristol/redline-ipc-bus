@@ -9,6 +9,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 
 #include "errors.hpp"
 #include "subscriber.hpp"
@@ -126,6 +127,11 @@ public:
   //
   // thread-safe: multiple threads can call publish concurrently
   virtual ErrorCode publish(const std::span<const uint8_t>& data, int64_t timeout_us = -1) = 0;
+
+  // Publishes the bytes of a string, e.g. bus->publish("hello")
+  ErrorCode publish(std::string_view data, int64_t timeout_us = -1) {
+    return publish(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(data.data()), data.size()), timeout_us);
+  }
 
   // Publishes several messages with a single reservation, so they get consecutive sequence numbers and contend with
   // other producers once rather than once per message. All or nothing: nothing is published if any message is too
