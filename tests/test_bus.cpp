@@ -84,7 +84,7 @@ TEST_P(BusAnyMode, EmptyAndMaximumSizeMessages) {
   ASSERT_EQ(bus->add_subscriber(collector.callback()), ErrorCode::OK);
 
   const std::vector<uint8_t> max(config().max_message_size, 0x5A);
-  EXPECT_EQ(bus->publish({}), ErrorCode::OK);
+  EXPECT_EQ(bus->publish(std::span<const uint8_t>{}), ErrorCode::OK);
   EXPECT_EQ(bus->publish(max), ErrorCode::OK);
   EXPECT_EQ(bus->publish(std::vector<uint8_t>(config().max_message_size + 1)), ErrorCode::MESSAGE_TOO_LARGE);
 
@@ -95,6 +95,25 @@ TEST_P(BusAnyMode, EmptyAndMaximumSizeMessages) {
   EXPECT_EQ(bus->publish(as_bytes("next")), ErrorCode::OK);
   ASSERT_TRUE(wait_until([&] { return collector.size() == 3; }));
   EXPECT_EQ(collector.sequences[2], 2u);
+}
+
+TEST_P(BusAnyMode, PublishesStrings) {
+  ScopedBusName name;
+  Collector collector;
+  auto bus = create_bus(name, config());
+  ASSERT_EQ(bus->add_subscriber(collector.callback()), ErrorCode::OK);
+
+  const std::string owned = "from a std::string";
+  ASSERT_EQ(bus->publish("literal"), ErrorCode::OK);
+  ASSERT_EQ(bus->publish(owned), ErrorCode::OK);
+  ASSERT_EQ(bus->publish(std::string_view()), ErrorCode::OK);
+  EXPECT_EQ(bus->publish(std::string(config().max_message_size + 1, 'x')), ErrorCode::MESSAGE_TOO_LARGE);
+
+  ASSERT_TRUE(wait_until([&] { return collector.size() == 3; }));
+  const auto text = [&](size_t i) { return std::string(collector.payloads[i].begin(), collector.payloads[i].end()); };
+  EXPECT_EQ(text(0), "literal");
+  EXPECT_EQ(text(1), owned);
+  EXPECT_EQ(text(2), "");
 }
 
 TEST_P(BusAnyMode, AllCallbacksOnABusReceiveEveryMessage) {
