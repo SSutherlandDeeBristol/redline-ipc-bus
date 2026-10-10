@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.preset }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [debug, release, asan, tsan]
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg-cache
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Dependencies are built without sanitizers, so every preset can share one cache of them
+      - name: Cache vcpkg packages
+        uses: actions/cache@v4
+        with:
+          path: vcpkg-cache
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+
+      - name: Set up vcpkg at the manifest's baseline
+        run: |
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+          git clone https://github.com/microsoft/vcpkg.git "$VCPKG_ROOT"
+          git -C "$VCPKG_ROOT" checkout "$(jq -r '."builtin-baseline"' vcpkg.json)"
+          "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
+
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }} -DREDLINE_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }} -j "$(nproc)"
+
+      - name: Test
+        run: |
+          if [ "${{ matrix.preset }}" = tsan ]; then
+            # TSan needs address space layout randomisation reduced on recent kernels
+            setarch -R ctest --preset tsan
+          else
+            ctest --preset ${{ matrix.preset }}
+          fi
