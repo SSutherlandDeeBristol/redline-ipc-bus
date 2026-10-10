@@ -38,8 +38,8 @@ std::string_view hello = "hello";
 bus->publish({reinterpret_cast<const uint8_t*>(hello.data()), hello.size()});
 ```
 
-Every process attaching to a bus must agree on `max_message_size`, `bus_size`, `max_subscribers` and
-`backpressure_mode`; `create_bus` throws if they don't. A bus outlives the processes using it, so call `redline::destroy_bus(name)` to remove it.
+Every process attaching to a bus must agree on `max_message_size`, `bus_size` and `max_subscribers`; `create_bus`
+throws if they don't. A bus outlives the processes using it, so call `redline::destroy_bus(name)` to remove it.
 
 ### Ways to subscribe
 
@@ -68,7 +68,7 @@ producer contends with other producers once per batch instead of once per messag
 ### Zero-copy reads
 
 By default subscribers copy each message out of shared memory before running callbacks, so a slow callback never
-holds a slot. With `config.zero_copy_reads = true` (`RELIABLE` only; each `Bus` chooses for itself) callbacks read the slot in
+holds a slot. With `zero_copy_reads` (in `Config`, or `SubscriberOptions` per subscriber; `RELIABLE` only) callbacks read the slot in
 place and it is released when they return. That saves a copy per message, which matters for large messages, at the
 cost of holding publishers up for as long as callbacks run. Zero-copy subscribers are never evicted by
 `subscriber_timeout_us`, since evicting one mid-callback would let publishers overwrite what it is reading.
@@ -81,11 +81,17 @@ process-wide hook. By default warnings and errors go to stderr; route them into 
 
 ## Delivery semantics
 
-| | `RELIABLE` | `BEST_EFFORT` |
+Each subscriber chooses its own mode, and both kinds can share a bus: for example a lossless consumer alongside
+monitoring tools that must never slow it down. The default comes from `Config::backpressure_mode`; `own_thread`
+callbacks and `subscribe()` can override it with `SubscriberOptions::backpressure_mode`.
+
+| Subscriber mode | `RELIABLE` | `BEST_EFFORT` |
 |---|---|---|
-| Publisher when the ring is full | waits (up to `timeout_us`, else `BACKPRESSURE_TIMEOUT`) | overwrites the oldest message |
-| Slow subscriber | throttles every publisher; optionally evicted after `subscriber_timeout_us` | skips ahead, counts `dropped_messages` |
-| Messages lost | never, unless a subscriber is evicted (counted as dropped) | when a subscriber is lapped (counted as dropped) |
+| Publishers, once it is a full ring behind | wait (up to `timeout_us`, else `BACKPRESSURE_TIMEOUT`) | carry on, overwriting the oldest message |
+| If it is slow | throttles every publisher; optionally evicted after `subscriber_timeout_us` | skips ahead, counts `dropped_messages` |
+| Messages it loses | none, unless evicted (counted as dropped) | those it was lapped on (counted as dropped) |
+
+Publishers only ever wait for `RELIABLE` subscribers; with none on the bus, `publish` never waits.
 
 In both modes:
 
@@ -96,8 +102,7 @@ In both modes:
 - Subscribers left behind by crashed processes are detected and reclaimed, so they never block `RELIABLE` publishers.
   Each subscriber holds an open file description lock on its registry entry, which the kernel releases however the
   process exits, so this also works between containers with separate pid namespaces (as long as they share `/dev/shm`).
-- `publish` is thread-safe, and in `BEST_EFFORT` mode never waits for subscribers. Publishing makes no syscalls unless
-  a subscriber is asleep waiting for messages.
+- `publish` is thread-safe. It makes no syscalls unless a subscriber is asleep waiting for messages.
 - `Message::publish_timestamp_ns` uses `CLOCK_MONOTONIC`, which is shared by every process on the host; compare it
   with `redline::now_ns()`.
 

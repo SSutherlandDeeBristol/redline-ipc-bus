@@ -9,7 +9,7 @@ namespace shm {
 static constexpr uint64_t MAGIC = 0x123ff123;
 // Bump whenever the layout of anything in this file changes. Segments created by a build with a different version are
 // rejected rather than misinterpreted.
-static constexpr uint64_t VERSION = 3;
+static constexpr uint64_t VERSION = 4;
 static constexpr uint64_t CACHE_LINE_SIZE = 64;
 
 enum class SegmentInitState : uint32_t { UNINITIALISED, INITIALISING, INITIALISED };
@@ -21,6 +21,7 @@ enum class SubscriberState : uint32_t { EMPTY, INITIALISING, OK, DEAD };
 
 // SubscriberEntry::flags
 static constexpr uint32_t SUBSCRIBER_NO_EVICT = 1; // reads slots in place, so must never be overwritten mid-read
+static constexpr uint32_t SUBSCRIBER_RELIABLE = 2; // publishers never overwrite a message this subscriber hasn't read
 
 // Pid is informational only. Whether an entry's owner is still alive is decided by its lease, which works across pid
 // namespaces.
@@ -68,7 +69,6 @@ struct alignas(CACHE_LINE_SIZE) SHMSegment {
 
   std::atomic_uint32_t init_state = 0;
 
-  uint32_t backpressure_mode = 0;    // redline::BackPressureMode, must match across all processes
   uint32_t slot_count = 0;           // always a power of two
   uint32_t slot_size_bytes = 0;      // max payload size
   uint32_t subscriber_count = 0;     // entries in the subscriber registry

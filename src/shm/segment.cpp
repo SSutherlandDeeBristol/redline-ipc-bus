@@ -155,7 +155,6 @@ void SegmentMapping::create(const Config& config) {
   segment_->version = VERSION;
   segment_->segment_header_bytes = sizeof(SHMSegment);
   segment_->subscriber_entry_bytes = sizeof(SubscriberEntry);
-  segment_->backpressure_mode = uint32_t(config.backpressure_mode);
   segment_->slot_count = config.bus_size;
   segment_->slot_size_bytes = config.max_message_size;
   segment_->subscriber_count = config.max_subscribers;
@@ -230,7 +229,6 @@ bool SegmentMapping::open_existing(const Config& config) {
   if (segment_->slot_size_bytes != config.max_message_size) mismatch("slot size", config.max_message_size, segment_->slot_size_bytes);
   if (segment_->slot_count != config.bus_size) mismatch("slot count", config.bus_size, segment_->slot_count);
   if (segment_->subscriber_count != config.max_subscribers) mismatch("max subscribers", config.max_subscribers, segment_->subscriber_count);
-  if (segment_->backpressure_mode != uint32_t(config.backpressure_mode)) mismatch("backpressure mode", uint32_t(config.backpressure_mode), segment_->backpressure_mode);
 
   const Geometry g = geometry_for(config);
   if (segment_->total_bytes != g.total_bytes || segment_->slot_stride_bytes != g.slot_stride_bytes ||

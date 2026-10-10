@@ -144,11 +144,12 @@ TEST(Segment, RejectsMismatchedConfig) {
 
   EXPECT_NE(error_message([&] { create_bus(name, test_config(BackPressureMode::RELIABLE, 64, 512)); }).find("slot size"), std::string::npos);
   EXPECT_NE(error_message([&] { create_bus(name, test_config(BackPressureMode::RELIABLE, 128, 256)); }).find("slot count"), std::string::npos);
-  EXPECT_NE(error_message([&] { create_bus(name, test_config(BackPressureMode::BEST_EFFORT, 64, 256)); }).find("backpressure mode"), std::string::npos);
   Config more_subscribers = test_config(BackPressureMode::RELIABLE, 64, 256);
   more_subscribers.max_subscribers = 512;
   EXPECT_NE(error_message([&] { create_bus(name, more_subscribers); }).find("max subscribers"), std::string::npos);
   EXPECT_NO_THROW(create_bus(name, test_config(BackPressureMode::RELIABLE, 64, 256)));
+  // The mode is each subscriber's own choice, so it needn't match
+  EXPECT_NO_THROW(create_bus(name, test_config(BackPressureMode::BEST_EFFORT, 64, 256)));
 }
 
 TEST(Segment, RejectsIncompatibleVersionOrMagic) {

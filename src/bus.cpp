@@ -61,7 +61,8 @@ void consume_safely(Subscriber& subscriber, const Message& message, const size_t
 // and each own_thread callback.
 class SubscriptionImpl final : public Subscription {
 public:
-  SubscriptionImpl(std::shared_ptr<shm::SegmentMapping> mapping, const Config& config, std::unique_ptr<shm::SubscriberLease> lease)
+  SubscriptionImpl(std::shared_ptr<shm::SegmentMapping> mapping, const Config& config, const bool zero_copy,
+                   std::unique_ptr<shm::SubscriberLease> lease)
       : mapping_(std::move(mapping)),
         segment_(mapping_->segment()),
         ring_buffer_(mapping_),
@@ -69,7 +70,7 @@ public:
         entry_(lease_->entry()),
         name_(mapping_->name()),
         slot_count_(segment_->slot_count),
-        zero_copy_(config.zero_copy_reads),
+        zero_copy_(zero_copy),
         spin_duration_ns_(config.consumer_busy_spin_duration_us * 1000),
         histogram_(config.latency_histogram_significant_figures),
         read_seq_(entry_.read_seq.load(std::memory_order_acquire)),
@@ -312,16 +313,12 @@ public:
 
     const int64_t timestamp_ns = now_ns();
 
+    if (count > slot_count_) {
+      return ErrorCode::INVALID_ARGUMENT;
+    }
     uint64_t first_seq;
-    if (config_.backpressure_mode == BackPressureMode::RELIABLE) {
-      if (count > slot_count_) {
-        return ErrorCode::INVALID_ARGUMENT;
-      }
-      if (!reserve_reliable(count, timeout_us, first_seq)) {
-        return ErrorCode::BACKPRESSURE_TIMEOUT;
-      }
-    } else {
-      first_seq = segment_->write_seq.fetch_add(count, std::memory_order_seq_cst);
+    if (!reserve(count, timeout_us, first_seq)) {
+      return ErrorCode::BACKPRESSURE_TIMEOUT;
     }
 
     // A false return means a later lap already took the slot, which subscribers will account for as a drop
@@ -352,9 +349,13 @@ public:
 
     std::lock_guard lk(subscriber_creation_mutex_);
 
+    if (!valid(options, !options.own_thread)) {
+      return ErrorCode::INVALID_ARGUMENT;
+    }
+
     if (options.own_thread) {
       std::unique_ptr<SubscriptionImpl> subscription;
-      if (const auto ec = try_subscribe(subscription); ec != ErrorCode::OK) {
+      if (const auto ec = try_subscribe(subscription, options); ec != ErrorCode::OK) {
         return ec;
       }
       auto& own = own_thread_subscribers_.emplace_back();
@@ -368,7 +369,7 @@ public:
     // The first callback registers this Bus as a subscriber; nothing is recorded unless that succeeds
     const bool first = !shared_subscription_;
     if (first) {
-      if (const auto ec = try_subscribe(shared_subscription_); ec != ErrorCode::OK) {
+      if (const auto ec = try_subscribe(shared_subscription_, options); ec != ErrorCode::OK) {
         return ec;
       }
     }
@@ -387,12 +388,12 @@ public:
     return ErrorCode::OK;
   }
 
-  std::unique_ptr<Subscription> subscribe() override {
-    auto lease = subscriber_registry_->register_subscriber(!config_.zero_copy_reads);
-    if (!lease) {
-      return nullptr;
+  std::unique_ptr<Subscription> subscribe(const SubscriberOptions& options) override {
+    if (options.own_thread || !valid(options, false)) {
+      throw std::invalid_argument("invalid SubscriberOptions for subscribe(): own_thread is for add_subscriber, and "
+                                  "zero_copy_reads requires RELIABLE");
     }
-    return std::make_unique<SubscriptionImpl>(segment_mapping_, config_, std::move(lease));
+    return make_subscription(options);
   }
 
   SubscriberMetricsSnapshot get_subscriber_metrics() const override {
@@ -458,19 +459,36 @@ private:
   std::atomic_bool kill_{false};
   std::thread poll_thread_;
 
-  ErrorCode try_subscribe(std::unique_ptr<SubscriptionImpl>& subscription) {
-    std::unique_ptr<shm::SubscriberLease> lease;
+  // Shared-thread callbacks always use the Config; the overrides are for subscribers with a position of their own
+  bool valid(const SubscriberOptions& options, const bool shared_thread) const noexcept {
+    if (shared_thread && (options.backpressure_mode || options.zero_copy_reads)) {
+      return false;
+    }
+    return !(options.zero_copy_reads.value_or(config_.zero_copy_reads) &&
+             options.backpressure_mode.value_or(config_.backpressure_mode) != BackPressureMode::RELIABLE);
+  }
+
+  // Returns nullptr if the registry is full. Options must already be valid.
+  std::unique_ptr<SubscriptionImpl> make_subscription(const SubscriberOptions& options) {
+    const bool reliable = options.backpressure_mode.value_or(config_.backpressure_mode) == BackPressureMode::RELIABLE;
+    const bool zero_copy = options.zero_copy_reads.value_or(config_.zero_copy_reads);
+    const uint32_t flags = (reliable ? shm::SUBSCRIBER_RELIABLE : 0) | (zero_copy ? shm::SUBSCRIBER_NO_EVICT : 0);
+
+    auto lease = subscriber_registry_->register_subscriber(flags);
+    if (!lease) {
+      return nullptr;
+    }
+    return std::make_unique<SubscriptionImpl>(segment_mapping_, config_, zero_copy, std::move(lease));
+  }
+
+  ErrorCode try_subscribe(std::unique_ptr<SubscriptionImpl>& subscription, const SubscriberOptions& options) {
     try {
-      lease = subscriber_registry_->register_subscriber(!config_.zero_copy_reads);
+      subscription = make_subscription(options);
     } catch (const std::exception& e) {
       REDLINE_LOG(ERROR) << "Failed to register subscriber on " << name_ << ": " << e.what();
       return ErrorCode::UNKNOWN_ERROR;
     }
-    if (!lease) {
-      return ErrorCode::SUBSCRIBER_REGISTRY_FULL;
-    }
-    subscription = std::make_unique<SubscriptionImpl>(segment_mapping_, config_, std::move(lease));
-    return ErrorCode::OK;
+    return subscription ? ErrorCode::OK : ErrorCode::SUBSCRIBER_REGISTRY_FULL;
   }
 
   template <typename Deliver>
@@ -482,10 +500,10 @@ private:
     }
   }
 
-  // Reserves `count` consecutive sequences once every live subscriber has consumed the messages currently in their
-  // slots. The compare-exchange makes the capacity check and the reservation one step, so concurrent producers can't
-  // overrun a subscriber between them.
-  bool reserve_reliable(const uint64_t count, const int64_t timeout_us, uint64_t& first_seq) {
+  // Reserves `count` consecutive sequences once every live RELIABLE subscriber has consumed the messages currently in
+  // their slots (immediately, if there are none). The compare-exchange makes the capacity check and the reservation one
+  // step, so concurrent producers can't overrun a subscriber between them.
+  bool reserve(const uint64_t count, const int64_t timeout_us, uint64_t& first_seq) {
     uint64_t write_seq = segment_->write_seq.load(std::memory_order_seq_cst);
     int64_t start_us = -1;
     uint32_t spins = 0;
