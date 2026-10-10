@@ -1,3 +1,8 @@
 @PACKAGE_INIT@
 
+include(CMakeFindDependencyMacro)
+# redline links glog privately, but a static redline still needs it at link time
+find_dependency(glog CONFIG)
+
 include("${CMAKE_CURRENT_LIST_DIR}/redlineTargets.cmake")
+check_required_components(redline)

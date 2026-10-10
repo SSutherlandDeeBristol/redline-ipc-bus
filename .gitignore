@@ -41,3 +41,7 @@
 *.dwo
 
 .idea
+# Build directories
+cmake-build-*/
+build/
+CMakeUserPresets.json

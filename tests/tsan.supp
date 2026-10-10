@@ -1,0 +1,4 @@
+# The seqlock payload copies race with other writers by design: the slot version is re-checked after every read and
+# torn copies are discarded (see src/shm/ring_buffer.cpp). Nothing else should be suppressed here.
+race:redline::shm::seqlock_copy_to_slot
+race:redline::shm::seqlock_copy_from_slot
