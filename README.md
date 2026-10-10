@@ -73,6 +73,12 @@ place and it is released when they return. That saves a copy per message, which 
 cost of holding publishers up for as long as callbacks run. Zero-copy subscribers are never evicted by
 `subscriber_timeout_us`, since evicting one mid-callback would let publishers overwrite what it is reading.
 
+### Logging
+
+Redline reports rare events (segments created, subscribers evicted or reclaimed, callbacks throwing) through a
+process-wide hook. By default warnings and errors go to stderr; route them into your own logging with
+`redline::set_log_handler`, or pass an empty handler to silence them.
+
 ## Delivery semantics
 
 | | `RELIABLE` | `BEST_EFFORT` |
@@ -97,7 +103,7 @@ In both modes:
 
 ## Building
 
-Redline is Linux-only. Dependencies (glog, plus GoogleTest and Google Benchmark for tests and benchmarks) come from
+Redline is Linux-only. The library has no dependencies. GoogleTest and Google Benchmark, for tests and benchmarks, come from
 [vcpkg](https://github.com/microsoft/vcpkg):
 
 ```sh

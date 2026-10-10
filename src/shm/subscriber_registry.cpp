@@ -8,7 +8,7 @@
 #include <string>
 #include <unistd.h>
 
-#include "glog/logging.h"
+#include "log.hpp"
 
 #include "layout.hpp"
 #include "redline/utils.hpp"
@@ -167,7 +167,7 @@ uint32_t SubscriberRegistry::reap(const int64_t now_ns, const int64_t subscriber
         state = subscriber.state.load(std::memory_order_acquire);
         if (state != uint32_t(SubscriberState::EMPTY) &&
             subscriber.state.compare_exchange_strong(state, uint32_t(SubscriberState::EMPTY))) {
-          LOG(WARNING) << "Reclaimed subscriber " << i << " on " << segment_->name() << " left behind by exited process "
+          REDLINE_LOG(WARNING) << "Reclaimed subscriber " << i << " on " << segment_->name() << " left behind by exited process "
                        << subscriber.pid.load(std::memory_order_relaxed);
           ++changed;
         }
@@ -182,7 +182,7 @@ uint32_t SubscriberRegistry::reap(const int64_t now_ns, const int64_t subscriber
       const int64_t heartbeat_ns = subscriber.heartbeat_ns.load(std::memory_order_relaxed);
       if (write_seq - read_seq >= shm_segment_->slot_count && now_ns - heartbeat_ns > subscriber_timeout_ns &&
           subscriber.state.compare_exchange_strong(state, uint32_t(SubscriberState::DEAD))) {
-        LOG(WARNING) << "Evicted subscriber " << i << " on " << segment_->name() << " (pid "
+        REDLINE_LOG(WARNING) << "Evicted subscriber " << i << " on " << segment_->name() << " (pid "
                      << subscriber.pid.load(std::memory_order_relaxed) << ") for blocking publishers";
         ++changed;
       }

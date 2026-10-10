@@ -45,8 +45,7 @@
       "name": "base",
       "hidden": true,
       "output": { "outputOnFailure": true },
-      "execution": { "jobs": 4, "timeout": 120 },
-      "environment": { "GLOG_minloglevel": "2" }
+      "execution": { "jobs": 4, "timeout": 120 }
     },
     { "name": "debug", "inherits": "base", "configurePreset": "debug" },
     { "name": "release", "inherits": "base", "configurePreset": "release" },

@@ -9,7 +9,7 @@
 #include <thread>
 #include <unistd.h>
 
-#include "glog/logging.h"
+#include "log.hpp"
 
 #include "layout.hpp"
 #include "redline/config.hpp"
@@ -174,7 +174,7 @@ void SegmentMapping::create(const Config& config) {
   // Publishes all of the above to processes waiting in open_existing
   segment_->init_state.store(uint32_t(SegmentInitState::INITIALISED), std::memory_order_release);
 
-  LOG(INFO) << "Created new shared memory segment at " << name_;
+  REDLINE_LOG(INFO) << "Created new shared memory segment at " << name_;
 }
 
 bool SegmentMapping::open_existing(const Config& config) {
@@ -255,7 +255,7 @@ bool SegmentMapping::open_existing(const Config& config) {
   slot_mask_ = segment_->slot_mask;
   slot_stride_ = g.slot_stride_bytes;
 
-  LOG(INFO) << "Opened existing shared memory segment at " << name_;
+  REDLINE_LOG(INFO) << "Opened existing shared memory segment at " << name_;
   return true;
 }
 }

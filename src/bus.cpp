@@ -13,7 +13,7 @@
 #include <unistd.h>
 #include <vector>
 
-#include "glog/logging.h"
+#include "log.hpp"
 
 #include "redline/config.hpp"
 #include "redline/utils.hpp"
@@ -50,9 +50,9 @@ void consume_safely(Subscriber& subscriber, const Message& message, const size_t
   try {
     subscriber.consume(message);
   } catch (const std::exception& e) {
-    LOG(ERROR) << "Subscriber callback " << index << " threw exception: " << e.what();
+    REDLINE_LOG(ERROR) << "Subscriber callback " << index << " threw exception: " << e.what();
   } catch (...) {
-    LOG(ERROR) << "Subscriber callback " << index << " threw a non-std::exception";
+    REDLINE_LOG(ERROR) << "Subscriber callback " << index << " threw a non-std::exception";
   }
 }
 }
@@ -262,7 +262,7 @@ private:
       return state == uint32_t(shm::SubscriberState::OK);
     }
 
-    LOG(WARNING) << "Subscriber on " << name_ << " was evicted for blocking publishers, skipping ahead";
+    REDLINE_LOG(WARNING) << "Subscriber on " << name_ << " was evicted for blocking publishers, skipping ahead";
     heartbeat(now_ns());
     entry_.state.store(uint32_t(shm::SubscriberState::OK), std::memory_order_seq_cst);
     const uint64_t write_seq = segment_->write_seq.load(std::memory_order_seq_cst);
@@ -463,7 +463,7 @@ private:
     try {
       lease = subscriber_registry_->register_subscriber(!config_.zero_copy_reads);
     } catch (const std::exception& e) {
-      LOG(ERROR) << "Failed to register subscriber on " << name_ << ": " << e.what();
+      REDLINE_LOG(ERROR) << "Failed to register subscriber on " << name_ << ": " << e.what();
       return ErrorCode::UNKNOWN_ERROR;
     }
     if (!lease) {

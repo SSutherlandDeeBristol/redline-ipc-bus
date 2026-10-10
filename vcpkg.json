@@ -5,8 +5,7 @@
   "description": "Shared-memory message bus for same-host IPC",
   "dependencies": [
     "gtest",
-    "benchmark",
-    "glog"
+    "benchmark"
   ],
   "builtin-baseline": "e456309491fd875487bf02b8a0dca76c1b1b00cc"
 }
