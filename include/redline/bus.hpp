@@ -63,6 +63,61 @@ struct SubscriberOptions {
   std::optional<bool> zero_copy_reads = std::nullopt;
 };
 
+class BusImpl;
+
+namespace detail {
+class ClaimOwner {
+public:
+  virtual void commit_claim(uint64_t sequence, uint32_t size) noexcept = 0;
+  virtual void abort_claim(uint64_t sequence) noexcept = 0;
+
+protected:
+  ~ClaimOwner() = default;
+};
+}
+
+// A slot reserved by Bus::claim(), for building a message directly in shared memory instead of copying it in.
+// Write the message into data(), then commit() the bytes used. A claim that is destroyed or reassigned without being
+// committed is aborted: its sequence number is skipped and subscribers never see it.
+//
+// Subscribers receive messages in order, so none of them can get past this sequence until it is committed or aborted:
+// keep claims short. In particular, don't publish more than bus_size messages from the thread holding a claim while
+// RELIABLE subscribers are on the bus, since they would be waiting on the claim while you wait on them.
+// A claim may be moved to and committed from another thread, but must be finished before its Bus is destroyed.
+class Claim {
+public:
+  Claim() = default;
+  Claim(Claim&& other) noexcept;
+  Claim& operator=(Claim&& other) noexcept;
+  ~Claim();
+
+  Claim(const Claim&) = delete;
+  Claim& operator=(const Claim&) = delete;
+
+  // True while the claim is open (claimed and not yet committed or aborted)
+  explicit operator bool() const noexcept { return owner_ != nullptr; }
+
+  // Where to write the message: max_message_size bytes. Empty if the claim isn't open.
+  std::span<uint8_t> data() const noexcept { return data_; }
+  uint64_t sequence() const noexcept { return sequence_; }
+
+  // Publishes the first `size` bytes of data(). Returns INVALID_ARGUMENT if the claim isn't open, and
+  // MESSAGE_TOO_LARGE (leaving the claim open) if size is larger than data().
+  ErrorCode commit(size_t size) noexcept;
+
+  // Gives the sequence up. Does nothing if the claim isn't open.
+  void abort() noexcept;
+
+private:
+  friend class BusImpl;
+  Claim(detail::ClaimOwner* owner, uint64_t sequence, std::span<uint8_t> data) noexcept
+      : owner_(owner), sequence_(sequence), data_(data) {}
+
+  detail::ClaimOwner* owner_ = nullptr;
+  uint64_t sequence_ = 0;
+  std::span<uint8_t> data_;
+};
+
 class Bus {
 public:
   // Waits up to timeout_us (-1 = forever, 0 = not at all) while the slot is still holding a message some RELIABLE
@@ -77,6 +132,16 @@ public:
   // large or there is no room for all of them before the timeout. A batch may hold at most bus_size messages,
   // otherwise INVALID_ARGUMENT.
   virtual ErrorCode publish_batch(std::span<const std::span<const uint8_t>> messages, int64_t timeout_us = -1) = 0;
+
+  // Reserves the next slot for writing a message in place, waiting for RELIABLE subscribers like publish(). Any claim
+  // already held in `claim` is aborted first. The message is timestamped when it is committed. Thread-safe.
+  //
+  //   redline::Claim claim;
+  //   if (bus->claim(claim) == redline::ErrorCode::OK) {
+  //     size_t size = serialize_into(claim.data());
+  //     claim.commit(size);
+  //   }
+  virtual ErrorCode claim(Claim& claim, int64_t timeout_us = -1) = 0;
 
   // By default all callbacks on a Bus share one poll thread and one position on the bus: they run one after another
   // for each message, starting from messages published after the first callback was added, so a slow callback delays

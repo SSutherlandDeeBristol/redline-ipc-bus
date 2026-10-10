@@ -58,6 +58,9 @@ struct SlotHeader {
 static constexpr uint64_t SLOT_HEADER_SIZE = 32;
 static_assert(sizeof(SlotHeader) <= SLOT_HEADER_SIZE);
 
+// SlotHeader::size of a sequence whose producer gave it up (an aborted Claim): subscribers skip it
+static constexpr uint32_t ABORTED_SIZE = UINT32_MAX;
+
 constexpr uint64_t writing_version(uint64_t seq) { return 2 * seq + 1; }
 constexpr uint64_t committed_version(uint64_t seq) { return 2 * seq + 2; }
 

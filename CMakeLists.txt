@@ -131,6 +131,7 @@ if(REDLINE_BUILD_TESTS)
     tests/test_publish_batch.cpp
     tests/test_logging.cpp
     tests/test_mixed_modes.cpp
+    tests/test_claim.cpp
   )
   # Tests exercise internals directly, so they see the private headers too
   target_include_directories(redline_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

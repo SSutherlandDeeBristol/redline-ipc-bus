@@ -12,15 +12,24 @@ public:
   enum class ReadResult : uint32_t {
     OK,          // message copied out intact
     NOT_READY,   // not published yet, or still being written
-    OVERWRITTEN  // a later lap has (or is about to have) replaced this message
+    OVERWRITTEN, // a later lap has (or is about to have) replaced this message
+    SKIPPED      // the producer aborted this sequence, so there is no message to deliver
   };
 
   explicit RingBuffer(std::shared_ptr<SegmentMapping> segment);
 
   // Writes the message for a sequence the caller has reserved from write_seq. Waits for an older lap that is still
   // mid-write on the same slot. Returns false if a later lap has already claimed the slot, in which case the message
-  // is lost (only possible when producers lap each other in BEST_EFFORT mode, or with no subscribers).
+  // is lost (only possible when producers lap each other, which RELIABLE subscribers prevent).
   bool write(uint64_t seq, const std::span<const uint8_t>& data, int64_t timestamp_ns) noexcept;
+
+  // write() in two halves, for producers that build the message in place. begin_write claims the slot for a reserved
+  // `seq` and returns where its payload goes (slot_size_bytes long), or nullptr if a later lap has already claimed it.
+  // Subscribers see `seq` as not ready until it is committed or aborted, which must follow.
+  uint8_t* begin_write(uint64_t seq) noexcept;
+  void commit(uint64_t seq, uint32_t size, int64_t timestamp_ns) noexcept;
+  // Commits `seq` as a gap that subscribers skip
+  void abort(uint64_t seq, int64_t timestamp_ns) noexcept { commit(seq, ABORTED_SIZE, timestamp_ns); }
 
   struct ReadOutcome {
     ReadResult result;

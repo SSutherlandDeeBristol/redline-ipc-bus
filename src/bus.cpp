@@ -11,6 +11,7 @@
 #include <sys/mman.h>
 #include <thread>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 #include "log.hpp"
@@ -133,6 +134,12 @@ public:
       }
       if (outcome.result == shm::RingBuffer::ReadResult::OVERWRITTEN) {
         skip_overwritten();
+        continue;
+      }
+      if (outcome.result == shm::RingBuffer::ReadResult::SKIPPED) {
+        // An aborted claim: nothing was published under this sequence, so it is neither delivered nor dropped
+        read_seq_ = seq + 1;
+        entry_.read_seq.store(seq + 1, std::memory_order_release);
         continue;
       }
 
@@ -286,7 +293,7 @@ private:
   }
 };
 
-class BusImpl : public Bus {
+class BusImpl : public Bus, private detail::ClaimOwner {
 public:
   BusImpl(const std::string& name, const Config& config) : name_(name), config_(config) {
     segment_mapping_ = shm::SegmentMapping::open_or_create(segment_name(name), config);
@@ -325,14 +332,24 @@ public:
     for (uint64_t i = 0; i < count; ++i) {
       ring_buffer_->write(first_seq + i, messages[i], timestamp_ns);
     }
-
-    // Only pay for a syscall when a subscriber is actually asleep. The fence pairs with the one in sleep_until_ready:
-    // either we see its waiter count, or it sees our commit.
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    if (segment_->waiters.load(std::memory_order_relaxed) != 0) {
-      wake_sleepers(segment_);
-    }
+    wake_if_sleeping();
     return ErrorCode::OK;
+  }
+
+  ErrorCode claim(Claim& claim, const int64_t timeout_us) override {
+    claim.abort();
+    while (true) {
+      uint64_t seq;
+      if (!reserve(1, timeout_us, seq)) {
+        return ErrorCode::BACKPRESSURE_TIMEOUT;
+      }
+      if (uint8_t* data = ring_buffer_->begin_write(seq)) {
+        claim = Claim(this, seq, std::span<uint8_t>(data, segment_->slot_size_bytes));
+        return ErrorCode::OK;
+      }
+      // Producers lapped each other and a later lap already took this slot, so this sequence is lost to subscribers
+      // (they count it as dropped). Take the next one.
+    }
   }
 
   ErrorCode add_subscriber(const std::function<void(const Message&)>& callback, const SubscriberOptions& options) override {
@@ -422,6 +439,25 @@ public:
   }
 
 private:
+  void commit_claim(const uint64_t sequence, const uint32_t size) noexcept override {
+    ring_buffer_->commit(sequence, size, now_ns());
+    wake_if_sleeping();
+  }
+
+  void abort_claim(const uint64_t sequence) noexcept override {
+    ring_buffer_->abort(sequence, now_ns());
+    wake_if_sleeping(); // subscribers waiting on this sequence can move past it
+  }
+
+  // Only pay for a syscall when a subscriber is actually asleep. The fence pairs with the one in sleep_until_ready:
+  // either we see its waiter count, or it sees our commit.
+  void wake_if_sleeping() noexcept {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (segment_->waiters.load(std::memory_order_relaxed) != 0) {
+      wake_sleepers(segment_);
+    }
+  }
+
   struct OwnThreadSubscriber {
     std::unique_ptr<SubscriptionImpl> subscription;
     std::thread thread;
@@ -581,6 +617,42 @@ private:
     });
   }
 };
+
+Claim::Claim(Claim&& other) noexcept
+    : owner_(std::exchange(other.owner_, nullptr)), sequence_(other.sequence_), data_(std::exchange(other.data_, {})) {}
+
+Claim& Claim::operator=(Claim&& other) noexcept {
+  if (this != &other) {
+    abort();
+    owner_ = std::exchange(other.owner_, nullptr);
+    sequence_ = other.sequence_;
+    data_ = std::exchange(other.data_, {});
+  }
+  return *this;
+}
+
+Claim::~Claim() {
+  abort();
+}
+
+ErrorCode Claim::commit(const size_t size) noexcept {
+  if (!owner_) {
+    return ErrorCode::INVALID_ARGUMENT;
+  }
+  if (size > data_.size()) {
+    return ErrorCode::MESSAGE_TOO_LARGE;
+  }
+  std::exchange(owner_, nullptr)->commit_claim(sequence_, uint32_t(size));
+  data_ = {};
+  return ErrorCode::OK;
+}
+
+void Claim::abort() noexcept {
+  if (owner_) {
+    std::exchange(owner_, nullptr)->abort_claim(sequence_);
+    data_ = {};
+  }
+}
 
 std::unique_ptr<Bus> create_bus(const std::string &name, const Config &config) {
   return std::make_unique<BusImpl>(name, config);

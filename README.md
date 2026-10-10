@@ -65,6 +65,22 @@ Anything a callback captures must outlive the `Bus` (or `Subscription`) it was a
 `publish_batch` reserves room for several messages at once, so they get consecutive sequence numbers and the
 producer contends with other producers once per batch instead of once per message. It is all or nothing.
 
+### Zero-copy publishing
+
+`claim` reserves the next slot and hands you its memory, so a message can be serialized straight into shared memory
+(for example with FlatBuffers, Cap'n Proto or SBE) instead of being built elsewhere and copied in:
+
+```cpp
+redline::Claim claim;
+if (bus->claim(claim) == redline::ErrorCode::OK) {
+  size_t size = serialize_into(claim.data());  // up to max_message_size bytes
+  claim.commit(size);                          // a claim that isn't committed is aborted, and subscribers skip it
+}
+```
+
+Messages are delivered in order, so subscribers can't get past an open claim: commit promptly. Combined with
+zero-copy reads, a message is written once and never copied.
+
 ### Zero-copy reads
 
 By default subscribers copy each message out of shared memory before running callbacks, so a slow callback never
@@ -140,6 +156,7 @@ producers). Indicative numbers on a 12-core desktop, Release build:
 | 4 / 8 producers, 1 subscriber, 64 B, `RELIABLE` | ~16M / ~14M msg/s |
 | Round trip, 16 B | ~1.1 µs |
 | Round trip, 4 KiB | ~2.3 µs, ~1.8 µs with zero-copy reads |
+| Publish to delivery, 4 KiB, claim + zero-copy reads | p50 ~150-260 ns (vs ~1 µs copying both ways) |
 
 A single producer with a caught-up subscriber is limited by cache lines bouncing between their cores on every
 message; batching amortises that.
