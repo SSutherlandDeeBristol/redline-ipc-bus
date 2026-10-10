@@ -6,8 +6,6 @@
 #include <iostream>
 #include <thread>
 
-#include "glog/logging.h"
-
 #include "redline/utils.hpp"
 
 namespace {
@@ -36,8 +34,9 @@ int main() {
     const int64_t current_time_ns = now_ns();
 
     if (current_time_ns - last_time_ns > 1'000'000'000) {
-      LOG(INFO) << "Message: " << message.data_as_string();
-      LOG(INFO) << "Received " << messageCount << " messages in the last second, average latency: " << (messageCount > 0 ? (total_latency_ns) / double(messageCount) : 0.0) << " ns";
+      std::cout << "Message: " << message.data_as_string() << "\n"
+                << "Received " << messageCount << " messages in the last second, average latency: "
+                << (messageCount > 0 ? (total_latency_ns) / double(messageCount) : 0.0) << " ns" << std::endl;
       last_time_ns = current_time_ns;
       messageCount = 0;
       total_latency_ns = 0.0;
@@ -54,7 +53,7 @@ int main() {
       message = "Hello, world! " + std::to_string(counter++);
       auto ec = bus->publish(std::span((const uint8_t*) message.data(), message.size()), -1);
       if (ec != ErrorCode::OK) {
-        LOG(ERROR) << "Failed to publish message: " << static_cast<int>(ec);
+        std::cerr << "Failed to publish message: " << static_cast<int>(ec) << std::endl;
       }
     }
   });
@@ -64,7 +63,7 @@ int main() {
     const auto metrics = bus->get_subscriber_metrics();
     // Report percentiles per interval rather than since startup
     bus->reset_subscriber_metrics();
-    LOG(INFO) << "Subscriber metrics:\nmessages_consumed=" << metrics.messages_consumed
+    std::cout << "Subscriber metrics:\nmessages_consumed=" << metrics.messages_consumed
               << "\ndropped_messages=" << metrics.dropped_messages
               << "\ncurrent_lag=" << metrics.current_lag
               << "\nmax_lag=" << metrics.max_lag
@@ -72,7 +71,7 @@ int main() {
               << "\np50_latency_ns=" << metrics.p50_latency_ns
               << "\np90_latency_ns=" << metrics.p90_latency_ns
               << "\np99_latency_ns=" << metrics.p99_latency_ns
-              << "\np999_latency_ns=" << metrics.p999_latency_ns;
+              << "\np999_latency_ns=" << metrics.p999_latency_ns << std::endl;
   }
 
   publish_thread_1.join();

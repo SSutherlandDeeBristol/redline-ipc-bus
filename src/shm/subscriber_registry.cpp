@@ -8,7 +8,7 @@
 #include <string>
 #include <unistd.h>
 
-#include "glog/logging.h"
+#include "log.hpp"
 
 #include "layout.hpp"
 #include "redline/utils.hpp"
@@ -59,7 +59,7 @@ void SubscriberLease::abandon() noexcept {
 SubscriberRegistry::SubscriberRegistry(std::shared_ptr<SegmentMapping> segment)
     : segment_(std::move(segment)), shm_segment_(segment_->segment()) {}
 
-std::unique_ptr<SubscriberLease> SubscriberRegistry::register_subscriber(const bool evictable) {
+std::unique_ptr<SubscriberLease> SubscriberRegistry::register_subscriber(const uint32_t flags) {
   // A new description of the same segment, so the lease conflicts with every other description, including the ones
   // other leases in this process use. Reopening through /proc also works after the segment has been unlinked.
   const std::string path = "/proc/self/fd/" + std::to_string(segment_->fd());
@@ -80,7 +80,7 @@ std::unique_ptr<SubscriberLease> SubscriberRegistry::register_subscriber(const b
 
   auto& subscriber = lease->entry();
   subscriber.pid.store(getpid(), std::memory_order_relaxed);
-  subscriber.flags.store(evictable ? 0 : SUBSCRIBER_NO_EVICT, std::memory_order_relaxed);
+  subscriber.flags.store(flags, std::memory_order_relaxed);
   subscriber.heartbeat_ns.store(now_ns(), std::memory_order_relaxed);
   subscriber.dropped_count.store(0, std::memory_order_relaxed);
   subscriber.messages_consumed.store(0, std::memory_order_relaxed);
@@ -129,7 +129,9 @@ std::optional<uint64_t> SubscriberRegistry::min_read_seq() const noexcept {
   const uint32_t limit = scan_limit();
   for (uint32_t i = 0; i < limit; ++i) {
     const auto& subscriber = segment_->subscriber(i);
-    if (subscriber.state.load(std::memory_order_seq_cst) == uint32_t(SubscriberState::OK)) {
+    // flags are written before the entry becomes OK, so they're settled by the time it counts
+    if (subscriber.state.load(std::memory_order_seq_cst) == uint32_t(SubscriberState::OK) &&
+        (subscriber.flags.load(std::memory_order_relaxed) & SUBSCRIBER_RELIABLE) != 0) {
       const uint64_t read_seq = subscriber.read_seq.load(std::memory_order_acquire);
       min = min ? std::min(*min, read_seq) : read_seq;
     }
@@ -167,7 +169,7 @@ uint32_t SubscriberRegistry::reap(const int64_t now_ns, const int64_t subscriber
         state = subscriber.state.load(std::memory_order_acquire);
         if (state != uint32_t(SubscriberState::EMPTY) &&
             subscriber.state.compare_exchange_strong(state, uint32_t(SubscriberState::EMPTY))) {
-          LOG(WARNING) << "Reclaimed subscriber " << i << " on " << segment_->name() << " left behind by exited process "
+          REDLINE_LOG(WARNING) << "Reclaimed subscriber " << i << " on " << segment_->name() << " left behind by exited process "
                        << subscriber.pid.load(std::memory_order_relaxed);
           ++changed;
         }
@@ -176,13 +178,15 @@ uint32_t SubscriberRegistry::reap(const int64_t now_ns, const int64_t subscriber
       }
     }
 
-    const bool evictable = (subscriber.flags.load(std::memory_order_relaxed) & SUBSCRIBER_NO_EVICT) == 0;
+    // Only RELIABLE subscribers can block publishers, so only they are worth evicting
+    const uint32_t flags = subscriber.flags.load(std::memory_order_relaxed);
+    const bool evictable = (flags & SUBSCRIBER_RELIABLE) != 0 && (flags & SUBSCRIBER_NO_EVICT) == 0;
     if (subscriber_timeout_ns > 0 && evictable && state == uint32_t(SubscriberState::OK)) {
       const uint64_t read_seq = subscriber.read_seq.load(std::memory_order_acquire);
       const int64_t heartbeat_ns = subscriber.heartbeat_ns.load(std::memory_order_relaxed);
       if (write_seq - read_seq >= shm_segment_->slot_count && now_ns - heartbeat_ns > subscriber_timeout_ns &&
           subscriber.state.compare_exchange_strong(state, uint32_t(SubscriberState::DEAD))) {
-        LOG(WARNING) << "Evicted subscriber " << i << " on " << segment_->name() << " (pid "
+        REDLINE_LOG(WARNING) << "Evicted subscriber " << i << " on " << segment_->name() << " (pid "
                      << subscriber.pid.load(std::memory_order_relaxed) << ") for blocking publishers";
         ++changed;
       }

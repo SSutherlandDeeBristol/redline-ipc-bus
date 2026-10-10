@@ -44,14 +44,15 @@ public:
   // Claims an entry for this process, starting at the current head of the bus with fresh metrics. Reclaims entries
   // left behind by exited processes if the registry is full. Returns nullptr if it is still full, and throws
   // std::runtime_error if the lease's file description can't be opened.
-  // Entries registered with evictable = false are never evicted for being slow.
-  std::unique_ptr<SubscriberLease> register_subscriber(bool evictable = true);
+  // `flags` are SUBSCRIBER_* flags: RELIABLE subscribers hold publishers back, NO_EVICT ones are never evicted.
+  std::unique_ptr<SubscriberLease> register_subscriber(uint32_t flags = SUBSCRIBER_RELIABLE);
 
-  // Lowest read_seq across live subscribers, or nullopt if there are none
+  // Lowest read_seq across live RELIABLE subscribers, or nullopt if there are none
   std::optional<uint64_t> min_read_seq() const noexcept;
 
-  // Frees entries whose owner has exited. If subscriber_timeout_ns > 0, also evicts evictable live subscribers that
-  // are at least a full ring behind and haven't heartbeated within the timeout. Returns how many entries were changed.
+  // Frees entries whose owner has exited. If subscriber_timeout_ns > 0, also evicts live RELIABLE subscribers (without
+  // NO_EVICT) that are at least a full ring behind and haven't heartbeated within the timeout. Returns how many
+  // entries were changed.
   uint32_t reap(int64_t now_ns, int64_t subscriber_timeout_ns) noexcept;
 
   // True if some file description other than the segment's own holds the lease on entry `index`

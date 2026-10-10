@@ -47,11 +47,6 @@ elseif(NOT REDLINE_SANITIZER STREQUAL "")
 endif()
 
 # ----------------------------
-# Dependencies (vcpkg)
-# ----------------------------
-find_package(glog CONFIG REQUIRED)
-
-# ----------------------------
 # Library
 # ----------------------------
 add_library(redline)
@@ -67,6 +62,8 @@ target_sources(redline
   PRIVATE
   src/bus.cpp
   src/cpu.hpp
+  src/log.hpp
+  src/log.cpp
   src/histogram.hpp
   src/subscriber.cpp
   src/shm/layout.hpp
@@ -83,12 +80,6 @@ target_sources(redline
 target_include_directories(redline
   PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
-)
-
-# glog is an implementation detail: none of the public headers use it
-target_link_libraries(redline
-  PRIVATE
-  glog::glog
 )
 
 # ----------------------------
@@ -112,7 +103,7 @@ redline_apply_warnings(redline)
 # ----------------------------
 if(REDLINE_BUILD_EXAMPLES)
   add_executable(redline_pubsub_basic examples/pubsub_basic.cpp)
-  target_link_libraries(redline_pubsub_basic PRIVATE redline glog::glog)
+  target_link_libraries(redline_pubsub_basic PRIVATE redline)
   redline_apply_warnings(redline_pubsub_basic)
 endif()
 
@@ -138,13 +129,15 @@ if(REDLINE_BUILD_TESTS)
     tests/test_subscription.cpp
     tests/test_zero_copy.cpp
     tests/test_publish_batch.cpp
+    tests/test_logging.cpp
+    tests/test_mixed_modes.cpp
+    tests/test_claim.cpp
   )
   # Tests exercise internals directly, so they see the private headers too
   target_include_directories(redline_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(redline_tests
     PRIVATE
     redline
-    glog::glog
     GTest::gtest
     GTest::gtest_main
   )

@@ -9,7 +9,7 @@
 #include <thread>
 #include <unistd.h>
 
-#include "glog/logging.h"
+#include "log.hpp"
 
 #include "layout.hpp"
 #include "redline/config.hpp"
@@ -155,7 +155,6 @@ void SegmentMapping::create(const Config& config) {
   segment_->version = VERSION;
   segment_->segment_header_bytes = sizeof(SHMSegment);
   segment_->subscriber_entry_bytes = sizeof(SubscriberEntry);
-  segment_->backpressure_mode = uint32_t(config.backpressure_mode);
   segment_->slot_count = config.bus_size;
   segment_->slot_size_bytes = config.max_message_size;
   segment_->subscriber_count = config.max_subscribers;
@@ -174,7 +173,7 @@ void SegmentMapping::create(const Config& config) {
   // Publishes all of the above to processes waiting in open_existing
   segment_->init_state.store(uint32_t(SegmentInitState::INITIALISED), std::memory_order_release);
 
-  LOG(INFO) << "Created new shared memory segment at " << name_;
+  REDLINE_LOG(INFO) << "Created new shared memory segment at " << name_;
 }
 
 bool SegmentMapping::open_existing(const Config& config) {
@@ -230,7 +229,6 @@ bool SegmentMapping::open_existing(const Config& config) {
   if (segment_->slot_size_bytes != config.max_message_size) mismatch("slot size", config.max_message_size, segment_->slot_size_bytes);
   if (segment_->slot_count != config.bus_size) mismatch("slot count", config.bus_size, segment_->slot_count);
   if (segment_->subscriber_count != config.max_subscribers) mismatch("max subscribers", config.max_subscribers, segment_->subscriber_count);
-  if (segment_->backpressure_mode != uint32_t(config.backpressure_mode)) mismatch("backpressure mode", uint32_t(config.backpressure_mode), segment_->backpressure_mode);
 
   const Geometry g = geometry_for(config);
   if (segment_->total_bytes != g.total_bytes || segment_->slot_stride_bytes != g.slot_stride_bytes ||
@@ -255,7 +253,7 @@ bool SegmentMapping::open_existing(const Config& config) {
   slot_mask_ = segment_->slot_mask;
   slot_stride_ = g.slot_stride_bytes;
 
-  LOG(INFO) << "Opened existing shared memory segment at " << name_;
+  REDLINE_LOG(INFO) << "Opened existing shared memory segment at " << name_;
   return true;
 }
 }

@@ -11,9 +11,10 @@
 #include <sys/mman.h>
 #include <thread>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
-#include "glog/logging.h"
+#include "log.hpp"
 
 #include "redline/config.hpp"
 #include "redline/utils.hpp"
@@ -50,9 +51,9 @@ void consume_safely(Subscriber& subscriber, const Message& message, const size_t
   try {
     subscriber.consume(message);
   } catch (const std::exception& e) {
-    LOG(ERROR) << "Subscriber callback " << index << " threw exception: " << e.what();
+    REDLINE_LOG(ERROR) << "Subscriber callback " << index << " threw exception: " << e.what();
   } catch (...) {
-    LOG(ERROR) << "Subscriber callback " << index << " threw a non-std::exception";
+    REDLINE_LOG(ERROR) << "Subscriber callback " << index << " threw a non-std::exception";
   }
 }
 }
@@ -61,7 +62,8 @@ void consume_safely(Subscriber& subscriber, const Message& message, const size_t
 // and each own_thread callback.
 class SubscriptionImpl final : public Subscription {
 public:
-  SubscriptionImpl(std::shared_ptr<shm::SegmentMapping> mapping, const Config& config, std::unique_ptr<shm::SubscriberLease> lease)
+  SubscriptionImpl(std::shared_ptr<shm::SegmentMapping> mapping, const Config& config, const bool zero_copy,
+                   std::unique_ptr<shm::SubscriberLease> lease)
       : mapping_(std::move(mapping)),
         segment_(mapping_->segment()),
         ring_buffer_(mapping_),
@@ -69,7 +71,7 @@ public:
         entry_(lease_->entry()),
         name_(mapping_->name()),
         slot_count_(segment_->slot_count),
-        zero_copy_(config.zero_copy_reads),
+        zero_copy_(zero_copy),
         spin_duration_ns_(config.consumer_busy_spin_duration_us * 1000),
         histogram_(config.latency_histogram_significant_figures),
         read_seq_(entry_.read_seq.load(std::memory_order_acquire)),
@@ -132,6 +134,12 @@ public:
       }
       if (outcome.result == shm::RingBuffer::ReadResult::OVERWRITTEN) {
         skip_overwritten();
+        continue;
+      }
+      if (outcome.result == shm::RingBuffer::ReadResult::SKIPPED) {
+        // An aborted claim: nothing was published under this sequence, so it is neither delivered nor dropped
+        read_seq_ = seq + 1;
+        entry_.read_seq.store(seq + 1, std::memory_order_release);
         continue;
       }
 
@@ -262,7 +270,7 @@ private:
       return state == uint32_t(shm::SubscriberState::OK);
     }
 
-    LOG(WARNING) << "Subscriber on " << name_ << " was evicted for blocking publishers, skipping ahead";
+    REDLINE_LOG(WARNING) << "Subscriber on " << name_ << " was evicted for blocking publishers, skipping ahead";
     heartbeat(now_ns());
     entry_.state.store(uint32_t(shm::SubscriberState::OK), std::memory_order_seq_cst);
     const uint64_t write_seq = segment_->write_seq.load(std::memory_order_seq_cst);
@@ -285,7 +293,7 @@ private:
   }
 };
 
-class BusImpl : public Bus {
+class BusImpl : public Bus, private detail::ClaimOwner {
 public:
   BusImpl(const std::string& name, const Config& config) : name_(name), config_(config) {
     segment_mapping_ = shm::SegmentMapping::open_or_create(segment_name(name), config);
@@ -312,30 +320,36 @@ public:
 
     const int64_t timestamp_ns = now_ns();
 
+    if (count > slot_count_) {
+      return ErrorCode::INVALID_ARGUMENT;
+    }
     uint64_t first_seq;
-    if (config_.backpressure_mode == BackPressureMode::RELIABLE) {
-      if (count > slot_count_) {
-        return ErrorCode::INVALID_ARGUMENT;
-      }
-      if (!reserve_reliable(count, timeout_us, first_seq)) {
-        return ErrorCode::BACKPRESSURE_TIMEOUT;
-      }
-    } else {
-      first_seq = segment_->write_seq.fetch_add(count, std::memory_order_seq_cst);
+    if (!reserve(count, timeout_us, first_seq)) {
+      return ErrorCode::BACKPRESSURE_TIMEOUT;
     }
 
     // A false return means a later lap already took the slot, which subscribers will account for as a drop
     for (uint64_t i = 0; i < count; ++i) {
       ring_buffer_->write(first_seq + i, messages[i], timestamp_ns);
     }
-
-    // Only pay for a syscall when a subscriber is actually asleep. The fence pairs with the one in sleep_until_ready:
-    // either we see its waiter count, or it sees our commit.
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    if (segment_->waiters.load(std::memory_order_relaxed) != 0) {
-      wake_sleepers(segment_);
-    }
+    wake_if_sleeping();
     return ErrorCode::OK;
+  }
+
+  ErrorCode claim(Claim& claim, const int64_t timeout_us) override {
+    claim.abort();
+    while (true) {
+      uint64_t seq;
+      if (!reserve(1, timeout_us, seq)) {
+        return ErrorCode::BACKPRESSURE_TIMEOUT;
+      }
+      if (uint8_t* data = ring_buffer_->begin_write(seq)) {
+        claim = Claim(this, seq, std::span<uint8_t>(data, segment_->slot_size_bytes));
+        return ErrorCode::OK;
+      }
+      // Producers lapped each other and a later lap already took this slot, so this sequence is lost to subscribers
+      // (they count it as dropped). Take the next one.
+    }
   }
 
   ErrorCode add_subscriber(const std::function<void(const Message&)>& callback, const SubscriberOptions& options) override {
@@ -352,9 +366,13 @@ public:
 
     std::lock_guard lk(subscriber_creation_mutex_);
 
+    if (!valid(options, !options.own_thread)) {
+      return ErrorCode::INVALID_ARGUMENT;
+    }
+
     if (options.own_thread) {
       std::unique_ptr<SubscriptionImpl> subscription;
-      if (const auto ec = try_subscribe(subscription); ec != ErrorCode::OK) {
+      if (const auto ec = try_subscribe(subscription, options); ec != ErrorCode::OK) {
         return ec;
       }
       auto& own = own_thread_subscribers_.emplace_back();
@@ -368,7 +386,7 @@ public:
     // The first callback registers this Bus as a subscriber; nothing is recorded unless that succeeds
     const bool first = !shared_subscription_;
     if (first) {
-      if (const auto ec = try_subscribe(shared_subscription_); ec != ErrorCode::OK) {
+      if (const auto ec = try_subscribe(shared_subscription_, options); ec != ErrorCode::OK) {
         return ec;
       }
     }
@@ -387,12 +405,12 @@ public:
     return ErrorCode::OK;
   }
 
-  std::unique_ptr<Subscription> subscribe() override {
-    auto lease = subscriber_registry_->register_subscriber(!config_.zero_copy_reads);
-    if (!lease) {
-      return nullptr;
+  std::unique_ptr<Subscription> subscribe(const SubscriberOptions& options) override {
+    if (options.own_thread || !valid(options, false)) {
+      throw std::invalid_argument("invalid SubscriberOptions for subscribe(): own_thread is for add_subscriber, and "
+                                  "zero_copy_reads requires RELIABLE");
     }
-    return std::make_unique<SubscriptionImpl>(segment_mapping_, config_, std::move(lease));
+    return make_subscription(options);
   }
 
   SubscriberMetricsSnapshot get_subscriber_metrics() const override {
@@ -421,6 +439,25 @@ public:
   }
 
 private:
+  void commit_claim(const uint64_t sequence, const uint32_t size) noexcept override {
+    ring_buffer_->commit(sequence, size, now_ns());
+    wake_if_sleeping();
+  }
+
+  void abort_claim(const uint64_t sequence) noexcept override {
+    ring_buffer_->abort(sequence, now_ns());
+    wake_if_sleeping(); // subscribers waiting on this sequence can move past it
+  }
+
+  // Only pay for a syscall when a subscriber is actually asleep. The fence pairs with the one in sleep_until_ready:
+  // either we see its waiter count, or it sees our commit.
+  void wake_if_sleeping() noexcept {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (segment_->waiters.load(std::memory_order_relaxed) != 0) {
+      wake_sleepers(segment_);
+    }
+  }
+
   struct OwnThreadSubscriber {
     std::unique_ptr<SubscriptionImpl> subscription;
     std::thread thread;
@@ -458,19 +495,36 @@ private:
   std::atomic_bool kill_{false};
   std::thread poll_thread_;
 
-  ErrorCode try_subscribe(std::unique_ptr<SubscriptionImpl>& subscription) {
-    std::unique_ptr<shm::SubscriberLease> lease;
+  // Shared-thread callbacks always use the Config; the overrides are for subscribers with a position of their own
+  bool valid(const SubscriberOptions& options, const bool shared_thread) const noexcept {
+    if (shared_thread && (options.backpressure_mode || options.zero_copy_reads)) {
+      return false;
+    }
+    return !(options.zero_copy_reads.value_or(config_.zero_copy_reads) &&
+             options.backpressure_mode.value_or(config_.backpressure_mode) != BackPressureMode::RELIABLE);
+  }
+
+  // Returns nullptr if the registry is full. Options must already be valid.
+  std::unique_ptr<SubscriptionImpl> make_subscription(const SubscriberOptions& options) {
+    const bool reliable = options.backpressure_mode.value_or(config_.backpressure_mode) == BackPressureMode::RELIABLE;
+    const bool zero_copy = options.zero_copy_reads.value_or(config_.zero_copy_reads);
+    const uint32_t flags = (reliable ? shm::SUBSCRIBER_RELIABLE : 0) | (zero_copy ? shm::SUBSCRIBER_NO_EVICT : 0);
+
+    auto lease = subscriber_registry_->register_subscriber(flags);
+    if (!lease) {
+      return nullptr;
+    }
+    return std::make_unique<SubscriptionImpl>(segment_mapping_, config_, zero_copy, std::move(lease));
+  }
+
+  ErrorCode try_subscribe(std::unique_ptr<SubscriptionImpl>& subscription, const SubscriberOptions& options) {
     try {
-      lease = subscriber_registry_->register_subscriber(!config_.zero_copy_reads);
+      subscription = make_subscription(options);
     } catch (const std::exception& e) {
-      LOG(ERROR) << "Failed to register subscriber on " << name_ << ": " << e.what();
+      REDLINE_LOG(ERROR) << "Failed to register subscriber on " << name_ << ": " << e.what();
       return ErrorCode::UNKNOWN_ERROR;
     }
-    if (!lease) {
-      return ErrorCode::SUBSCRIBER_REGISTRY_FULL;
-    }
-    subscription = std::make_unique<SubscriptionImpl>(segment_mapping_, config_, std::move(lease));
-    return ErrorCode::OK;
+    return subscription ? ErrorCode::OK : ErrorCode::SUBSCRIBER_REGISTRY_FULL;
   }
 
   template <typename Deliver>
@@ -482,10 +536,10 @@ private:
     }
   }
 
-  // Reserves `count` consecutive sequences once every live subscriber has consumed the messages currently in their
-  // slots. The compare-exchange makes the capacity check and the reservation one step, so concurrent producers can't
-  // overrun a subscriber between them.
-  bool reserve_reliable(const uint64_t count, const int64_t timeout_us, uint64_t& first_seq) {
+  // Reserves `count` consecutive sequences once every live RELIABLE subscriber has consumed the messages currently in
+  // their slots (immediately, if there are none). The compare-exchange makes the capacity check and the reservation one
+  // step, so concurrent producers can't overrun a subscriber between them.
+  bool reserve(const uint64_t count, const int64_t timeout_us, uint64_t& first_seq) {
     uint64_t write_seq = segment_->write_seq.load(std::memory_order_seq_cst);
     int64_t start_us = -1;
     uint32_t spins = 0;
@@ -563,6 +617,42 @@ private:
     });
   }
 };
+
+Claim::Claim(Claim&& other) noexcept
+    : owner_(std::exchange(other.owner_, nullptr)), sequence_(other.sequence_), data_(std::exchange(other.data_, {})) {}
+
+Claim& Claim::operator=(Claim&& other) noexcept {
+  if (this != &other) {
+    abort();
+    owner_ = std::exchange(other.owner_, nullptr);
+    sequence_ = other.sequence_;
+    data_ = std::exchange(other.data_, {});
+  }
+  return *this;
+}
+
+Claim::~Claim() {
+  abort();
+}
+
+ErrorCode Claim::commit(const size_t size) noexcept {
+  if (!owner_) {
+    return ErrorCode::INVALID_ARGUMENT;
+  }
+  if (size > data_.size()) {
+    return ErrorCode::MESSAGE_TOO_LARGE;
+  }
+  std::exchange(owner_, nullptr)->commit_claim(sequence_, uint32_t(size));
+  data_ = {};
+  return ErrorCode::OK;
+}
+
+void Claim::abort() noexcept {
+  if (owner_) {
+    std::exchange(owner_, nullptr)->abort_claim(sequence_);
+    data_ = {};
+  }
+}
 
 std::unique_ptr<Bus> create_bus(const std::string &name, const Config &config) {
   return std::make_unique<BusImpl>(name, config);

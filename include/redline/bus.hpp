@@ -6,6 +6,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 
@@ -29,8 +30,8 @@ struct SubscriberMetricsSnapshot {
 };
 
 // A subscriber that the caller drives, for use from your own thread or event loop. It has its own position on the bus,
-// starting at the newest message when it is created. While it exists it counts towards RELIABLE backpressure, so poll
-// it regularly. Destroying it unsubscribes. It may outlive the Bus that created it.
+// starting at the newest message when it is created. A RELIABLE subscription holds publishers back until it has read
+// each message, so poll it regularly. Destroying it unsubscribes. It may outlive the Bus that created it.
 //
 // poll() and wait() must not be called concurrently with each other; the metrics functions may be called from any thread.
 class Subscription {
@@ -51,25 +52,96 @@ public:
 };
 
 struct SubscriberOptions {
-  // Run this callback on a thread of its own, with its own position on the bus, so that it can't delay the other
-  // callbacks on this Bus or be delayed by them. Costs a thread and a subscriber registry entry per callback.
-  // Its metrics are not included in Bus::get_subscriber_metrics(); use subscribe() if you need them.
+  // add_subscriber only: run this callback on a thread of its own, with its own position on the bus, so that it can't
+  // delay the other callbacks on this Bus or be delayed by them. Costs a thread and a subscriber registry entry per
+  // callback. Its metrics are not included in Bus::get_subscriber_metrics(); use subscribe() if you need them.
   bool own_thread = false;
+
+  // Override the Bus' Config for this subscriber. Only for own_thread callbacks and subscribe(): callbacks sharing the
+  // Bus' poll thread always use its Config. zero_copy_reads requires RELIABLE.
+  std::optional<BackPressureMode> backpressure_mode = std::nullopt;
+  std::optional<bool> zero_copy_reads = std::nullopt;
+};
+
+class BusImpl;
+
+namespace detail {
+class ClaimOwner {
+public:
+  virtual void commit_claim(uint64_t sequence, uint32_t size) noexcept = 0;
+  virtual void abort_claim(uint64_t sequence) noexcept = 0;
+
+protected:
+  ~ClaimOwner() = default;
+};
+}
+
+// A slot reserved by Bus::claim(), for building a message directly in shared memory instead of copying it in.
+// Write the message into data(), then commit() the bytes used. A claim that is destroyed or reassigned without being
+// committed is aborted: its sequence number is skipped and subscribers never see it.
+//
+// Subscribers receive messages in order, so none of them can get past this sequence until it is committed or aborted:
+// keep claims short. In particular, don't publish more than bus_size messages from the thread holding a claim while
+// RELIABLE subscribers are on the bus, since they would be waiting on the claim while you wait on them.
+// A claim may be moved to and committed from another thread, but must be finished before its Bus is destroyed.
+class Claim {
+public:
+  Claim() = default;
+  Claim(Claim&& other) noexcept;
+  Claim& operator=(Claim&& other) noexcept;
+  ~Claim();
+
+  Claim(const Claim&) = delete;
+  Claim& operator=(const Claim&) = delete;
+
+  // True while the claim is open (claimed and not yet committed or aborted)
+  explicit operator bool() const noexcept { return owner_ != nullptr; }
+
+  // Where to write the message: max_message_size bytes. Empty if the claim isn't open.
+  std::span<uint8_t> data() const noexcept { return data_; }
+  uint64_t sequence() const noexcept { return sequence_; }
+
+  // Publishes the first `size` bytes of data(). Returns INVALID_ARGUMENT if the claim isn't open, and
+  // MESSAGE_TOO_LARGE (leaving the claim open) if size is larger than data().
+  ErrorCode commit(size_t size) noexcept;
+
+  // Gives the sequence up. Does nothing if the claim isn't open.
+  void abort() noexcept;
+
+private:
+  friend class BusImpl;
+  Claim(detail::ClaimOwner* owner, uint64_t sequence, std::span<uint8_t> data) noexcept
+      : owner_(owner), sequence_(sequence), data_(data) {}
+
+  detail::ClaimOwner* owner_ = nullptr;
+  uint64_t sequence_ = 0;
+  std::span<uint8_t> data_;
 };
 
 class Bus {
 public:
-  // timeout_us = -1 means no timeout (i.e. block indefinitely until message is published successfully)
-  // timeout_us has no effect if backpressure_mode is not BackPressureMode::RELIABLE
+  // Waits up to timeout_us (-1 = forever, 0 = not at all) while the slot is still holding a message some RELIABLE
+  // subscriber hasn't read; returns BACKPRESSURE_TIMEOUT if it doesn't free up in time. Never waits for BEST_EFFORT
+  // subscribers, which are overwritten instead.
   //
   // thread-safe: multiple threads can call publish concurrently
   virtual ErrorCode publish(const std::span<const uint8_t>& data, int64_t timeout_us = -1) = 0;
 
   // Publishes several messages with a single reservation, so they get consecutive sequence numbers and contend with
   // other producers once rather than once per message. All or nothing: nothing is published if any message is too
-  // large or (RELIABLE) there is no room for all of them before the timeout. In RELIABLE mode a batch may hold at most
-  // bus_size messages, otherwise INVALID_ARGUMENT.
+  // large or there is no room for all of them before the timeout. A batch may hold at most bus_size messages,
+  // otherwise INVALID_ARGUMENT.
   virtual ErrorCode publish_batch(std::span<const std::span<const uint8_t>> messages, int64_t timeout_us = -1) = 0;
+
+  // Reserves the next slot for writing a message in place, waiting for RELIABLE subscribers like publish(). Any claim
+  // already held in `claim` is aborted first. The message is timestamped when it is committed. Thread-safe.
+  //
+  //   redline::Claim claim;
+  //   if (bus->claim(claim) == redline::ErrorCode::OK) {
+  //     size_t size = serialize_into(claim.data());
+  //     claim.commit(size);
+  //   }
+  virtual ErrorCode claim(Claim& claim, int64_t timeout_us = -1) = 0;
 
   // By default all callbacks on a Bus share one poll thread and one position on the bus: they run one after another
   // for each message, starting from messages published after the first callback was added, so a slow callback delays
@@ -77,12 +149,14 @@ public:
   // Callbacks run on a background thread and must return quickly. Anything they capture must outlive the Bus.
   // If a callback throws, the exception is caught and logged, and the callback keeps receiving messages.
   // add_subscriber is thread-safe but may wait on a mutex if another thread is currently adding a subscriber.
+  // Returns INVALID_ARGUMENT for an empty callback or invalid options.
   virtual ErrorCode add_subscriber(const std::function<void(const Message&)>& callback, const SubscriberOptions& options = {}) = 0;
   virtual ErrorCode add_subscriber(std::shared_ptr<Subscriber> subscriber, const SubscriberOptions& options = {}) = 0;
 
-  // Creates a Subscription to poll from your own thread. Returns nullptr if the subscriber registry is full, and throws
-  // std::runtime_error if the subscription can't be set up.
-  virtual std::unique_ptr<Subscription> subscribe() = 0;
+  // Creates a Subscription to poll from your own thread. Returns nullptr if the subscriber registry is full. Throws
+  // std::invalid_argument for invalid options (including own_thread), and std::runtime_error if the subscription
+  // can't be set up.
+  virtual std::unique_ptr<Subscription> subscribe(const SubscriberOptions& options = {}) = 0;
 
   // Metrics for the callbacks sharing this Bus' poll thread. All zeros if there are none.
   virtual SubscriberMetricsSnapshot get_subscriber_metrics() const = 0;

@@ -30,8 +30,8 @@ struct RegistryFixture {
   SubscriberState state(uint32_t i) const { return SubscriberState(mapping->subscriber(i).state.load()); }
   uint32_t capacity() const { return mapping->subscriber_count(); }
 
-  std::unique_ptr<SubscriberLease> claim(bool evictable = true) {
-    auto lease = registry.register_subscriber(evictable);
+  std::unique_ptr<SubscriberLease> claim(uint32_t flags = shm::SUBSCRIBER_RELIABLE) {
+    auto lease = registry.register_subscriber(flags);
     EXPECT_NE(lease, nullptr);
     return lease;
   }
@@ -87,7 +87,7 @@ TEST(Registry, NewSubscriberStartsAtHeadWithFreshMetrics) {
   EXPECT_EQ(entry.messages_consumed.load(), 0u);
   EXPECT_EQ(entry.max_lag.load(), 0u);
   EXPECT_EQ(entry.last_latency_ns.load(), 0);
-  EXPECT_EQ(entry.flags.load(), 0u);
+  EXPECT_EQ(entry.flags.load(), shm::SUBSCRIBER_RELIABLE);
   EXPECT_GT(entry.heartbeat_ns.load(), 0);
 }
 
@@ -106,6 +106,11 @@ TEST(Registry, MinReadSeqOnlyCountsLiveSubscribers) {
 
   b.reset();
   EXPECT_EQ(f.registry.min_read_seq(), std::optional<uint64_t>(10));
+
+  // BEST_EFFORT subscribers never hold publishers back, however far behind they are
+  const auto lossy = f.claim(0);
+  lossy->entry().read_seq = 0;
+  EXPECT_EQ(f.registry.min_read_seq(), std::optional<uint64_t>(10));
 }
 
 TEST(Registry, HighWaterMarkBoundsScans) {
@@ -120,6 +125,7 @@ TEST(Registry, HighWaterMarkBoundsScans) {
   // An OK entry above the mark (which can't happen for real) is invisible to scans
   f.mapping->subscriber(100).state = uint32_t(SubscriberState::OK);
   f.mapping->subscriber(100).read_seq = 0;
+  f.mapping->subscriber(100).flags = shm::SUBSCRIBER_RELIABLE;
   a->entry().read_seq = 7;
   EXPECT_EQ(f.registry.min_read_seq(), std::optional<uint64_t>(7));
   f.mapping->subscriber(100).state = uint32_t(SubscriberState::EMPTY);
@@ -197,7 +203,8 @@ TEST(Registry, EvictsStalledSubscribersOnlyWhenConfigured) {
   const auto stalled = f.claim();
   const auto behind_but_recent = f.claim();
   const auto caught_up_but_idle = f.claim();
-  const auto stalled_but_not_evictable = f.claim(false);
+  const auto stalled_but_not_evictable = f.claim(shm::SUBSCRIBER_RELIABLE | shm::SUBSCRIBER_NO_EVICT);
+  const auto stalled_but_best_effort = f.claim(0);
   const int64_t now = now_ns();
   const int64_t timeout = 1'000'000;
 
@@ -210,6 +217,8 @@ TEST(Registry, EvictsStalledSubscribersOnlyWhenConfigured) {
   caught_up_but_idle->entry().heartbeat_ns = now - 2 * timeout;
   stalled_but_not_evictable->entry().read_seq = 100 - 16;
   stalled_but_not_evictable->entry().heartbeat_ns = now - 2 * timeout;
+  stalled_but_best_effort->entry().read_seq = 100 - 16;
+  stalled_but_best_effort->entry().heartbeat_ns = now - 2 * timeout;
 
   EXPECT_EQ(f.registry.reap(now, 0), 0u) << "eviction is off by default";
   EXPECT_EQ(f.state(stalled->index()), SubscriberState::OK);
@@ -219,6 +228,7 @@ TEST(Registry, EvictsStalledSubscribersOnlyWhenConfigured) {
   EXPECT_EQ(f.state(behind_but_recent->index()), SubscriberState::OK);
   EXPECT_EQ(f.state(caught_up_but_idle->index()), SubscriberState::OK);
   EXPECT_EQ(f.state(stalled_but_not_evictable->index()), SubscriberState::OK);
+  EXPECT_EQ(f.state(stalled_but_best_effort->index()), SubscriberState::OK) << "isn't blocking anyone";
 
   // An evicted subscriber that is still alive keeps its entry until it rejoins
   EXPECT_EQ(f.registry.reap(now, timeout), 0u);
