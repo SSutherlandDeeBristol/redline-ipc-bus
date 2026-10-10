@@ -73,6 +73,10 @@ target_sources(redline
   src/shm/ring_buffer.cpp
   src/shm/subscriber_registry.hpp
   src/shm/subscriber_registry.cpp
+  src/shm/publisher_registry.hpp
+  src/shm/publisher_registry.cpp
+  src/shm/lease.hpp
+  src/shm/lease.cpp
   src/shm/futex.hpp
   src/shm/futex.cpp
 )
@@ -134,6 +138,7 @@ if(REDLINE_BUILD_TESTS)
     tests/test_logging.cpp
     tests/test_mixed_modes.cpp
     tests/test_claim.cpp
+    tests/test_publisher_recovery.cpp
   )
   # Tests exercise internals directly, so they see the private headers too
   target_include_directories(redline_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

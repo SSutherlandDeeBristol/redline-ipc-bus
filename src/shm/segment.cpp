@@ -23,11 +23,11 @@ constexpr uint64_t align_up(uint64_t n, uint64_t a) {
 
 constexpr uint32_t MAX_BUS_SIZE = 1u << 30;
 constexpr uint32_t MAX_MESSAGE_SIZE = 1u << 30;
-constexpr uint32_t MAX_SUBSCRIBERS = 1u << 16;
 
 struct Geometry {
   uint64_t slot_stride_bytes;
   uint64_t subscribers_offset;
+  uint64_t publishers_offset;
   uint64_t slots_offset;
   uint64_t total_bytes;
 };
@@ -37,7 +37,8 @@ Geometry geometry_for(const Config& config) {
   Geometry g{};
   g.slot_stride_bytes = align_up(SLOT_HEADER_SIZE + uint64_t(config.max_message_size), CACHE_LINE_SIZE);
   g.subscribers_offset = align_up(sizeof(SHMSegment), CACHE_LINE_SIZE);
-  g.slots_offset = g.subscribers_offset + sizeof(SubscriberEntry) * uint64_t(config.max_subscribers);
+  g.publishers_offset = g.subscribers_offset + sizeof(SubscriberEntry) * uint64_t(config.max_subscribers);
+  g.slots_offset = g.publishers_offset + sizeof(PublisherEntry) * uint64_t(config.max_publishers);
   g.total_bytes = g.slots_offset + g.slot_stride_bytes * uint64_t(config.bus_size);
   return g;
 }
@@ -54,8 +55,11 @@ void SegmentMapping::validate_config(const Config& config) {
   if (config.max_message_size == 0 || config.max_message_size > MAX_MESSAGE_SIZE) {
     throw std::invalid_argument("max_message_size must be between 1 and 2^30, got " + std::to_string(config.max_message_size));
   }
-  if (config.max_subscribers == 0 || config.max_subscribers > MAX_SUBSCRIBERS) {
-    throw std::invalid_argument("max_subscribers must be between 1 and " + std::to_string(MAX_SUBSCRIBERS) + ", got " + std::to_string(config.max_subscribers));
+  if (config.max_subscribers == 0 || config.max_subscribers > MAX_REGISTRY_ENTRIES) {
+    throw std::invalid_argument("max_subscribers must be between 1 and " + std::to_string(MAX_REGISTRY_ENTRIES) + ", got " + std::to_string(config.max_subscribers));
+  }
+  if (config.max_publishers == 0 || config.max_publishers > MAX_REGISTRY_ENTRIES) {
+    throw std::invalid_argument("max_publishers must be between 1 and " + std::to_string(MAX_REGISTRY_ENTRIES) + ", got " + std::to_string(config.max_publishers));
   }
   if (config.backpressure_mode != BackPressureMode::RELIABLE && config.backpressure_mode != BackPressureMode::BEST_EFFORT) {
     throw std::invalid_argument("backpressure_mode is not a valid BackPressureMode");
@@ -155,10 +159,13 @@ void SegmentMapping::create(const Config& config) {
   segment_->version = VERSION;
   segment_->segment_header_bytes = sizeof(SHMSegment);
   segment_->subscriber_entry_bytes = sizeof(SubscriberEntry);
+  segment_->publisher_entry_bytes = sizeof(PublisherEntry);
   segment_->slot_count = config.bus_size;
   segment_->slot_size_bytes = config.max_message_size;
   segment_->subscriber_count = config.max_subscribers;
   segment_->subscribers_offset = g.subscribers_offset;
+  segment_->publisher_count = config.max_publishers;
+  segment_->publishers_offset = g.publishers_offset;
   segment_->slot_stride_bytes = g.slot_stride_bytes;
   segment_->slot_mask = config.bus_size - 1;
   segment_->slots_offset = g.slots_offset;
@@ -166,6 +173,8 @@ void SegmentMapping::create(const Config& config) {
 
   subscribers_ = reinterpret_cast<SubscriberEntry*>(static_cast<uint8_t*>(base_) + g.subscribers_offset);
   subscriber_count_ = config.max_subscribers;
+  publishers_ = reinterpret_cast<PublisherEntry*>(static_cast<uint8_t*>(base_) + g.publishers_offset);
+  publisher_count_ = config.max_publishers;
   slots_ = static_cast<uint8_t*>(base_) + g.slots_offset;
   slot_mask_ = segment_->slot_mask;
   slot_stride_ = g.slot_stride_bytes;
@@ -229,11 +238,14 @@ bool SegmentMapping::open_existing(const Config& config) {
   if (segment_->slot_size_bytes != config.max_message_size) mismatch("slot size", config.max_message_size, segment_->slot_size_bytes);
   if (segment_->slot_count != config.bus_size) mismatch("slot count", config.bus_size, segment_->slot_count);
   if (segment_->subscriber_count != config.max_subscribers) mismatch("max subscribers", config.max_subscribers, segment_->subscriber_count);
+  if (segment_->publisher_count != config.max_publishers) mismatch("max publishers", config.max_publishers, segment_->publisher_count);
+  if (segment_->publisher_entry_bytes != sizeof(PublisherEntry)) mismatch("publisher entry size", sizeof(PublisherEntry), segment_->publisher_entry_bytes);
 
   const Geometry g = geometry_for(config);
   if (segment_->total_bytes != g.total_bytes || segment_->slot_stride_bytes != g.slot_stride_bytes ||
       segment_->slots_offset != g.slots_offset ||
-      segment_->subscribers_offset != g.subscribers_offset || uint64_t(st.st_size) < g.total_bytes) {
+      segment_->subscribers_offset != g.subscribers_offset || segment_->publishers_offset != g.publishers_offset ||
+      uint64_t(st.st_size) < g.total_bytes) {
     fail("Shared memory segment at " + name_ + " has an unexpected size");
   }
 
@@ -249,6 +261,8 @@ bool SegmentMapping::open_existing(const Config& config) {
 
   subscribers_ = reinterpret_cast<SubscriberEntry*>(static_cast<uint8_t*>(base_) + g.subscribers_offset);
   subscriber_count_ = config.max_subscribers;
+  publishers_ = reinterpret_cast<PublisherEntry*>(static_cast<uint8_t*>(base_) + g.publishers_offset);
+  publisher_count_ = config.max_publishers;
   slots_ = static_cast<uint8_t*>(base_) + g.slots_offset;
   slot_mask_ = segment_->slot_mask;
   slot_stride_ = g.slot_stride_bytes;

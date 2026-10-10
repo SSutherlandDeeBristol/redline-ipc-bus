@@ -21,7 +21,7 @@ auto bus = redline::create_bus("telemetry", config);
 ```
 
 `create_bus` creates the shared memory segment `/dev/shm/redline.<name>` or opens it if it already exists. The first
-three fields below describe the segment, so every process on a bus must use the same values; `create_bus` throws
+four fields below describe the segment, so every process on a bus must use the same values; `create_bus` throws
 `std::runtime_error` if they differ. The rest only affect the process that sets them.
 
 | Field | Default | |
@@ -29,6 +29,7 @@ three fields below describe the segment, so every process on a bus must use the 
 | `max_message_size` | 4096 | Largest message in bytes. Each slot takes this plus 32 bytes, rounded up to 64. |
 | `bus_size` | 1024 | Number of slots. Must be a power of two. |
 | `max_subscribers` | 256 | Subscriber registry size, up to 65536, shared by all processes. |
+| `max_publishers` | 256 | Publisher registry size, up to 65536. Each publish in progress and each open claim uses an entry. |
 | `backpressure_mode` | `RELIABLE` | Default delivery mode for this `Bus`' subscribers. See [semantics](semantics.md). |
 | `zero_copy_reads` | `false` | Default for this `Bus`' subscribers. `RELIABLE` only. |
 | `consumer_busy_spin_duration_us` | 100 | How long an idle subscriber spins before sleeping. |
@@ -155,7 +156,7 @@ on a subscription.
 | Field | |
 |---|---|
 | `messages_consumed` | Messages delivered since the subscriber joined |
-| `dropped_messages` | Messages it missed after being lapped or evicted |
+| `dropped_messages` | Messages it missed after being lapped or evicted, or lost with a crashed publisher |
 | `current_lag` | Messages published that it hasn't read yet |
 | `max_lag` | Largest lag seen |
 | `last_latency_ns` | Publish-to-delivery time of the latest message |
@@ -188,6 +189,7 @@ and `subscribe` (`std::invalid_argument`). Everything else returns an `ErrorCode
 | `BACKPRESSURE_TIMEOUT` | A `RELIABLE` subscriber didn't free the slot within the timeout |
 | `MESSAGE_TOO_LARGE` | Larger than `max_message_size` |
 | `SUBSCRIBER_REGISTRY_FULL` | All `max_subscribers` entries are in use |
+| `PUBLISHER_REGISTRY_FULL` | All `max_publishers` entries are in use |
 | `INVALID_ARGUMENT` | Empty callback, invalid options, or a batch larger than the bus |
 | `NOT_FOUND` | `destroy_bus` on a bus that doesn't exist |
 | `UNKNOWN_ERROR` | A system call failed; the details are logged |

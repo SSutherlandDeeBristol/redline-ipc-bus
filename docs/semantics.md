@@ -32,7 +32,7 @@ These hold in both modes.
   Subscribers copy a message out and check the version again; a message overwritten during the copy is discarded and
   counted as dropped.
 - **Order.** Messages arrive in sequence-number order. Every sequence number is either delivered, counted in
-  `dropped_messages`, or belongs to an aborted claim.
+  `dropped_messages` (including messages lost with a crashed publisher), or belongs to an aborted claim.
 - **Start position.** A subscriber receives messages published after it joined, and nothing earlier.
 - **Crashed processes.** A subscriber whose process exits, however it exits, stops counting towards backpressure and
   its registry entry is reclaimed. Each subscriber holds an `F_OFD_SETLK` lock on one byte of the segment, which the
@@ -40,8 +40,10 @@ These hold in both modes.
   the processes share `/dev/shm`. A child forked (without `exec`) from a subscriber keeps the lock, and so the
   registration, until it exits.
 - **Crashed publishers.** A publisher that dies between reserving a slot and committing it (including with a claim
-  open) leaves that sequence unfinished. Subscribers stop at it, and publishers stop when they next reach its slot a
-  lap later. Redline does not yet recover from this; destroy and recreate the bus.
+  open) leaves that sequence unfinished, and subscribers and later publishers wait at it. After a millisecond (up to
+  50 ms for a subscriber that is asleep and gets no other messages) they check whether its publisher is still alive,
+  using the same kind of lock as subscribers, and if it isn't, they finish the sequence on its behalf. Subscribers count the message as dropped. A publisher that is merely slow, or a
+  claim held open for a long time, is never interfered with.
 - **Timestamps.** `Message::publish_timestamp_ns` is `CLOCK_MONOTONIC`, comparable across processes on the host with
   `redline::now_ns()`. `publish` stamps the message before writing it; a claim is stamped when it is committed.
 

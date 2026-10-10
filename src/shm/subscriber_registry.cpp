@@ -1,41 +1,15 @@
 #include "subscriber_registry.hpp"
 
 #include <algorithm>
-#include <cerrno>
-#include <cstring>
-#include <fcntl.h>
-#include <stdexcept>
-#include <string>
 #include <unistd.h>
 
 #include "log.hpp"
 
 #include "layout.hpp"
+#include "lease.hpp"
 #include "redline/utils.hpp"
 
 namespace redline::shm {
-namespace {
-// Write-locks byte `index` of the segment through `fd`. Fails if another open file description holds it. Locks taken
-// through the same description never conflict with each other.
-bool try_lock_entry(const int fd, const uint32_t index) noexcept {
-  struct flock lock{};
-  lock.l_type = F_WRLCK;
-  lock.l_whence = SEEK_SET;
-  lock.l_start = off_t(index);
-  lock.l_len = 1;
-  return fcntl(fd, F_OFD_SETLK, &lock) == 0;
-}
-
-void unlock_entry(const int fd, const uint32_t index) noexcept {
-  struct flock lock{};
-  lock.l_type = F_UNLCK;
-  lock.l_whence = SEEK_SET;
-  lock.l_start = off_t(index);
-  lock.l_len = 1;
-  fcntl(fd, F_OFD_SETLK, &lock);
-}
-}
-
 SubscriberLease::SubscriberLease(std::shared_ptr<SegmentMapping> segment, const uint32_t index, const int fd)
     : segment_(std::move(segment)), index_(index), fd_(fd) {}
 
@@ -60,13 +34,8 @@ SubscriberRegistry::SubscriberRegistry(std::shared_ptr<SegmentMapping> segment)
     : segment_(std::move(segment)), shm_segment_(segment_->segment()) {}
 
 std::unique_ptr<SubscriberLease> SubscriberRegistry::register_subscriber(const uint32_t flags) {
-  // A new description of the same segment, so the lease conflicts with every other description, including the ones
-  // other leases in this process use. Reopening through /proc also works after the segment has been unlinked.
-  const std::string path = "/proc/self/fd/" + std::to_string(segment_->fd());
-  const int fd = open(path.c_str(), O_RDWR | O_CLOEXEC);
-  if (fd < 0) {
-    throw std::runtime_error("Failed to open a subscriber lease on " + segment_->name() + ": " + std::strerror(errno));
-  }
+  // A description of our own, so the lease conflicts with every other one, including other leases in this process
+  const int fd = open_lease_description(*segment_);
 
   auto index = try_claim(fd);
   if (!index && reap(now_ns(), 0) > 0) {
@@ -103,7 +72,7 @@ std::optional<uint32_t> SubscriberRegistry::try_claim(const int fd) noexcept {
       continue;
     }
     // Lease first, so an entry that isn't EMPTY always has a holder unless its owner has gone
-    if (!try_lock_entry(fd, i)) {
+    if (!try_lock_byte(fd, subscriber_lock_offset(i))) {
       continue;
     }
     auto expected = uint32_t(SubscriberState::EMPTY);
@@ -115,7 +84,7 @@ std::optional<uint32_t> SubscriberRegistry::try_claim(const int fd) noexcept {
       }
       return i;
     }
-    unlock_entry(fd, i);
+    unlock_byte(fd, subscriber_lock_offset(i));
   }
   return std::nullopt;
 }
@@ -141,11 +110,7 @@ std::optional<uint64_t> SubscriberRegistry::min_read_seq() const noexcept {
 
 bool SubscriberRegistry::lease_held(const uint32_t index) const noexcept {
   std::lock_guard lk(segment_->probe_mutex());
-  if (!try_lock_entry(segment_->fd(), index)) {
-    return true;
-  }
-  unlock_entry(segment_->fd(), index);
-  return false;
+  return held_elsewhere(*segment_, subscriber_lock_offset(index));
 }
 
 uint32_t SubscriberRegistry::reap(const int64_t now_ns, const int64_t subscriber_timeout_ns) noexcept {
@@ -164,7 +129,7 @@ uint32_t SubscriberRegistry::reap(const int64_t now_ns, const int64_t subscriber
       // Holding the lock ourselves stops anyone claiming the entry while we decide. If we can't get it, its owner is
       // alive (or someone else is mid-claim or mid-probe), so leave it be.
       std::lock_guard lk(segment_->probe_mutex());
-      if (try_lock_entry(segment_->fd(), i)) {
+      if (try_lock_byte(segment_->fd(), subscriber_lock_offset(i))) {
         // Re-read: a clean deregistration stores EMPTY before releasing its lock
         state = subscriber.state.load(std::memory_order_acquire);
         if (state != uint32_t(SubscriberState::EMPTY) &&
@@ -173,7 +138,7 @@ uint32_t SubscriberRegistry::reap(const int64_t now_ns, const int64_t subscriber
                        << subscriber.pid.load(std::memory_order_relaxed);
           ++changed;
         }
-        unlock_entry(segment_->fd(), i);
+        unlock_byte(segment_->fd(), subscriber_lock_offset(i));
         continue;
       }
     }

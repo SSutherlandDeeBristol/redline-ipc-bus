@@ -1,7 +1,6 @@
 // Behaviour common to both backpressure modes, plus Bus lifecycle and cross-process tests
 #include <csignal>
 #include <mutex>
-#include <spawn.h>
 #include <sys/wait.h>
 #include <thread>
 
@@ -11,8 +10,6 @@
 #include "redline/utils.hpp"
 #include "shm/layout.hpp"
 #include "test_helpers.hpp"
-
-extern char** environ;
 
 using namespace redline;
 using namespace redline::test;
@@ -384,25 +381,6 @@ TEST(Bus, SleepingSubscriberIsWokenByPublish) {
   }
 }
 
-namespace {
-pid_t spawn_helper(const std::vector<std::string>& args) {
-  std::vector<char*> argv;
-  std::string path = REDLINE_TEST_HELPER;
-  argv.push_back(path.data());
-  std::vector<std::string> copy = args;
-  for (auto& a : copy) argv.push_back(a.data());
-  argv.push_back(nullptr);
-  pid_t pid = -1;
-  EXPECT_EQ(posix_spawn(&pid, path.c_str(), nullptr, nullptr, argv.data(), environ), 0);
-  return pid;
-}
-
-int wait_for_exit(pid_t pid) {
-  int status = 0;
-  waitpid(pid, &status, 0);
-  return status;
-}
-}
 
 TEST(CrossProcess, PublishFromAnotherProcess) {
   ScopedBusName name;

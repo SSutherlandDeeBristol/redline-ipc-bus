@@ -14,8 +14,9 @@ enum class BackPressureMode : uint32_t {
                   // what it missed as dropped
 };
 
-// All processes attaching to the same bus must use the same max_message_size, bus_size and max_subscribers, otherwise
-// create_bus throws. The remaining fields are local to each process (and are defaults for each Bus' subscribers).
+// All processes attaching to the same bus must use the same max_message_size, bus_size, max_subscribers and
+// max_publishers, otherwise create_bus throws. The remaining fields are local to each process (and are defaults for
+// each Bus' subscribers).
 struct Config {
   uint32_t max_message_size                 = 4096; // in bytes, must be > 0
   uint32_t bus_size                         = 1024; // number of message slots in the bus (must be a power of two >= 2), tune this to absorb bursts of messages
@@ -23,6 +24,10 @@ struct Config {
   // Subscriber registry entries (between 1 and 65536), shared by every process on the bus. Each Bus with shared-thread
   // callbacks, each own_thread callback and each Subscription takes one. Costs 128 bytes of shared memory per entry.
   uint32_t max_subscribers                  = 256;
+
+  // Publisher registry entries (between 1 and 65536), shared by every process on the bus. Each thread publishing
+  // through a Bus, and each open Claim, holds one while it publishes. Costs 64 bytes of shared memory per entry.
+  uint32_t max_publishers                   = 256;
 
   // Default for this Bus' subscribers; own_thread callbacks and subscribe() can override it via SubscriberOptions
   BackPressureMode backpressure_mode        = BackPressureMode::RELIABLE;

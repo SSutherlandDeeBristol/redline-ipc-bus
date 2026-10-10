@@ -9,6 +9,7 @@ enum class ErrorCode {
   SUBSCRIBER_REGISTRY_FULL, // All Config::max_subscribers registry entries are in use, across all processes
   NOT_FOUND, // No bus exists with the given name
   INVALID_ARGUMENT, // e.g. an empty callback
-  UNKNOWN_ERROR
+  UNKNOWN_ERROR,
+  PUBLISHER_REGISTRY_FULL, // All Config::max_publishers registry entries are in use, across all processes
 };
 }
