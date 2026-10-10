@@ -3,9 +3,10 @@
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
-#include <stdexcept>
 #include <string>
 #include <unistd.h>
+
+#include "log.hpp"
 
 namespace redline::shm {
 namespace {
@@ -19,11 +20,11 @@ bool set_lock(const int fd, const uint64_t offset, const short type) noexcept {
 }
 }
 
-int open_lease_description(const SegmentMapping& segment) {
+int open_lease_description(const SegmentMapping& segment) noexcept {
   const std::string path = "/proc/self/fd/" + std::to_string(segment.fd());
   const int fd = open(path.c_str(), O_RDWR | O_CLOEXEC);
   if (fd < 0) {
-    throw std::runtime_error("Failed to open a lease on " + segment.name() + ": " + std::strerror(errno));
+    REDLINE_LOG(ERROR) << "Failed to open a lease on " << segment.name() << ": " << std::strerror(errno);
   }
   return fd;
 }

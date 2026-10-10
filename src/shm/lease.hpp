@@ -11,8 +11,8 @@
 // alive, across pid namespaces.
 namespace redline::shm {
 // Opens a new description of the segment for holding leases. Reopening through /proc also works after the segment
-// has been unlinked. Throws std::runtime_error on failure.
-int open_lease_description(const SegmentMapping& segment);
+// has been unlinked. Returns -1, having logged why, on failure.
+int open_lease_description(const SegmentMapping& segment) noexcept;
 
 // Write-locks the byte at `offset` through `fd`. Fails if another description holds it.
 bool try_lock_byte(int fd, uint64_t offset) noexcept;

@@ -14,7 +14,7 @@ A bus is one shared memory segment, `/dev/shm/redline.<name>`, laid out as:
 +--------------------+---------------------------+---------------------------+------------------------------------+
 ```
 
-The header records a magic number, a layout version, the struct sizes and the segment-wide config. A process that
+The header records a magic number, a layout version, the struct sizes and the `BusLayout`. A process that
 opens the segment checks all of them and refuses a mismatch rather than misreading memory. The creator builds the
 segment with `O_EXCL` and publishes it by setting an init flag last; openers wait for that flag, up to
 `init_timeout_ms`.
@@ -61,8 +61,8 @@ never evict) and its metrics. It reads sequence `read_seq`, then advances `read_
 for `RELIABLE` publishers. In copy mode it advances before running callbacks; with zero-copy reads it advances after
 they return.
 
-A lapped `BEST_EFFORT` subscriber jumps to the oldest message still in the ring and adds the gap to
-`dropped_messages`. An evicted `RELIABLE` subscriber finds its entry marked `DEAD`, jumps to the newest message, and
+A lapped `BEST_EFFORT` subscriber jumps to the oldest message still in the ring, or the newest with
+`RESUME_AT_NEWEST`, and adds the gap to `dropped_messages`. An evicted `RELIABLE` subscriber finds its entry marked `DEAD`, jumps to the newest message, and
 marks itself live again.
 
 ## Liveness
@@ -79,7 +79,10 @@ Dead subscribers are reclaimed when a publisher is blocked or the subscriber reg
 
 ## Recovering from dead publishers
 
-Each publish in progress, and each open claim, holds a publisher registry entry. Before its reservation
+Each publish in progress, and each open claim, holds a publisher registry entry. A thread keeps the entry it first
+publishes with, cached per `Bus` in thread-local storage, until it exits or the `Bus` is destroyed, so publishing
+doesn't have to find a free entry and mark it in use every time. Claims take an entry from a pool for as long as they
+are open. Before its reservation
 compare-and-swap, a publisher writes the range it is about to reserve into its entry, and it clears the record only
 after committing everything in it. So any sequence below `write_seq` that isn't committed is covered by its owner's
 record.
@@ -91,12 +94,12 @@ it. A sequence covered only by dead records, and already reserved, can only belo
 reserve it again, so finishing it can't interfere with anyone. Only one process recovers at a time, under another
 byte lock, because finishing a slot the dead publisher had claimed takes several stores.
 
-Taking a lease and writing the record cost about 10 ns per publish.
-
 ## Costs
 
-- Crash safety for publishers adds about 10 ns to each publish.
-- One cache line moves between a publisher and a subscriber that has caught up, for every message. A single producer
-  with a subscriber that keeps up manages about 4M messages/s; batching amortises this.
+- Crash safety for publishers adds a few nanoseconds to each publish: two stores to record the reservation and one to
+  clear it.
+- One cache line moves between a publisher and a subscriber that has caught up, for every message. Between cores
+  that share a cache this allows about 10M messages/s from one producer; across core complexes or sockets it is a
+  few times slower. Batching amortises it.
 - Copy mode copies each message twice. Claims and zero-copy reads remove both copies.
 - Fixed-size slots waste space when message sizes vary widely.

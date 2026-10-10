@@ -23,7 +23,7 @@ set_property(CACHE REDLINE_SANITIZER PROPERTY STRINGS "" address thread)
 # ----------------------------
 # C++ standard
 # ----------------------------
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -61,11 +61,17 @@ target_include_directories(redline
 target_sources(redline
   PRIVATE
   src/bus.cpp
+  src/claim.cpp
+  src/clock.hpp
   src/cpu.hpp
   src/log.hpp
   src/log.cpp
   src/histogram.hpp
-  src/subscriber.cpp
+  src/producer.hpp
+  src/producer.cpp
+  src/subscription.hpp
+  src/subscription.cpp
+  src/wake.hpp
   src/shm/layout.hpp
   src/shm/segment.hpp
   src/shm/segment.cpp
@@ -85,6 +91,9 @@ target_include_directories(redline
   PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
+
+# The public headers use std::expected
+target_compile_features(redline PUBLIC cxx_std_23)
 
 # ----------------------------
 # Warnings
@@ -139,6 +148,8 @@ if(REDLINE_BUILD_TESTS)
     tests/test_mixed_modes.cpp
     tests/test_claim.cpp
     tests/test_publisher_recovery.cpp
+    tests/test_options.cpp
+    tests/test_publisher_leases.cpp
   )
   # Tests exercise internals directly, so they see the private headers too
   target_include_directories(redline_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -176,6 +187,11 @@ if(REDLINE_BUILD_BENCHMARKS)
     target_link_libraries(redline_${bench} PRIVATE redline benchmark::benchmark)
     redline_apply_warnings(redline_${bench})
   endforeach()
+
+  # Two processes; needs no benchmark library
+  add_executable(redline_bench_ipc benchmarks/bench_ipc.cpp)
+  target_link_libraries(redline_bench_ipc PRIVATE redline)
+  redline_apply_warnings(redline_bench_ipc)
 endif()
 
 # ----------------------------

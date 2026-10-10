@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/SSutherlandDeeBristol/redline-ipc-bus/actions/workflows/ci.yml/badge.svg)](https://github.com/SSutherlandDeeBristol/redline-ipc-bus/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)
+![C++23](https://img.shields.io/badge/C%2B%2B-23-blue.svg)
 ![Platform: Linux](https://img.shields.io/badge/platform-Linux-lightgrey.svg)
 
 Shared-memory publish/subscribe for processes on the same Linux host.
@@ -13,7 +13,8 @@ shared segment.
 
 ## Features
 
-- Low latency: about 1.1 µs for a ping-pong round trip. Publishing makes no system calls unless a subscriber is asleep.
+- Low latency: a round trip between two processes takes about 0.4 µs. Publishing makes no system calls unless a
+  subscriber is asleep.
 - Each subscriber chooses reliable or lossy delivery. Lossy subscribers never slow publishers down.
 - Zero-copy in both directions: build messages in place with `claim()`, read them in place with `zero_copy_reads`.
 - Survives crashed processes: dead subscribers stop holding publishers back, and messages left half-written by dead
@@ -32,7 +33,7 @@ shared segment.
 #include <thread>
 
 int main() {
-  auto bus = redline::create_bus("example", redline::Config{});
+  auto bus = redline::create_bus("example", {}).value(); // value() throws if it failed
   bus->add_subscriber([](const redline::Message& m) {
     std::cout << m.sequence << ": " << m.data_as_string() << std::endl;
   });
@@ -43,21 +44,26 @@ int main() {
 ```cpp
 // publisher.cpp
 #include <redline/bus.hpp>
+#include <iostream>
 
 int main() {
-  auto bus = redline::create_bus("example", redline::Config{});
-  bus->publish("hello");
+  auto bus = redline::create_bus("example", {}).value();
+  if (auto published = bus->publish("hello"); !published) {
+    std::cerr << redline::to_string(published.error()) << std::endl;
+  }
 }
 ```
 
-Start the subscriber first: subscribers only receive messages published after they join. Runnable versions are in
+Functions that can fail return `std::expected`; the library throws no exceptions of its own. Both processes pass the
+same `BusLayout` (here the default), which sets the message size and ring size; `open_bus("example")` would instead
+take it from the existing bus. Start the subscriber first: subscribers only receive messages published after they join. Runnable versions are in
 [`examples/`](examples) and build as `redline_subscriber` and `redline_publisher`.
 
 A bus outlives the processes using it. Remove it with `redline::destroy_bus("example")`.
 
 ## Installation
 
-Requires Linux 3.15 or later, CMake 3.22 and a C++20 compiler. CI uses GCC 13.
+Requires Linux 3.15 or later, CMake 3.22 and a C++23 compiler with `<expected>`. CI uses GCC 13.
 
 With CMake's `FetchContent`:
 
@@ -92,20 +98,25 @@ target_link_libraries(your_app PRIVATE redline::redline)
 
 ## Performance
 
-AMD Ryzen 5 3600 (6 cores), Linux 6.8, GCC 13.3, Release build:
+AMD Ryzen 5 3600 (6 cores), Linux 6.8, GCC 13.3, Release build, each thread or process pinned to its own core:
+
+| | Same core complex | Across core complexes |
+|---|---|---|
+| Round trip between two processes, 16 B (p50) | 0.36 µs | 0.89 µs |
+| Round trip between two processes, 4 KiB (p50) | 0.72 µs | 2.2 µs |
+| One process to another, 16 B | 9M to 11M msg/s | 4.8M msg/s |
+| One process to another, 4 KiB | 6.5M msg/s (27 GB/s) | 1.4M msg/s |
 
 | | |
 |---|---|
-| Publish, no subscribers, 16 B | 47 ns |
-| One publisher and subscriber, 16 B | 4.0M msg/s |
-| Same, `publish_batch` of 16 | 22M msg/s |
-| 4 to 8 publishers, one subscriber, 64 B | 12M to 20M msg/s, varying between runs |
-| Round trip, 16 B | 1.1 µs |
-| Round trip, 4 KiB | 2.4 µs (1.4 µs with zero-copy reads) |
-| Publish to delivery, 4 KiB, claim and zero-copy reads | 260 ns p50, 510 ns p99 |
+| Publish, no subscribers, 16 B | 45 ns |
+| One subscriber, `publish_batch` of 16, 64 B | 20M msg/s |
+| 4 to 8 publishers, one subscriber, 64 B | 16M to 20M msg/s |
 
-The round trips run between two threads through two buses, pinned to four cores. The benchmarks are in
-[`benchmarks/`](benchmarks); see [CONTRIBUTING.md](CONTRIBUTING.md#benchmarks) to run them.
+Cache lines travel much further between the 3600's two core complexes, hence the second column. The cross-process
+numbers come from `redline_bench_ipc`, with both sides busy-polling and latency metrics off (they add about 25 ns per
+message to each subscriber). The rest are threads in one process. The benchmarks are in [`benchmarks/`](benchmarks);
+see [CONTRIBUTING.md](CONTRIBUTING.md#benchmarks) to run them.
 
 ## Alternatives
 
@@ -118,7 +129,7 @@ no moving parts.
 
 ## Status
 
-Redline is young and its API may change before 1.0. The shared-memory layout is versioned, and a process refuses to
+Redline is young and its API may change before 1.0; there are no tagged releases yet. The shared-memory layout is versioned, and a process refuses to
 open a bus created by an incompatible version.
 
 ## Contributing

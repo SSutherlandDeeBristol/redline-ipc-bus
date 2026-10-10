@@ -16,11 +16,12 @@ std::unique_ptr<Bus> bus;
 // Args: backpressure mode, subscriber count (0 or 1), batch size
 void setup(const benchmark::State& state) {
   scoped = std::make_unique<bench::ScopedBus>("mp");
-  Config config;
-  config.bus_size = 8192;
-  config.max_message_size = 256;
-  config.backpressure_mode = static_cast<BackPressureMode>(state.range(0));
-  bus = create_bus(scoped->name(), config);
+  BusLayout layout;
+  layout.bus_size = 8192;
+  layout.max_message_size = 256;
+  BusOptions options;
+  options.backpressure_mode = static_cast<BackPressureMode>(state.range(0));
+  bus = bench::make_bus(scoped->name(), layout, options);
   if (state.range(1) != 0) {
     bus->add_subscriber([](const Message&) {});
   }

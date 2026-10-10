@@ -13,11 +13,11 @@ using namespace std::chrono_literals;
 TEST(BestEffort, StalledSubscriberNeverBlocksPublisher) {
   ScopedBusName name;
   std::atomic_bool release{false};
-  auto bus = create_bus(name, test_config(BackPressureMode::BEST_EFFORT, 8));
-  ASSERT_EQ(bus->add_subscriber([&](const Message&) { while (!release) std::this_thread::sleep_for(1ms); }), ErrorCode::OK);
+  auto bus = make_bus(name, test_config(BackPressureMode::BEST_EFFORT, 8));
+  ASSERT_TRUE(bus->add_subscriber([&](const Message&) { while (!release) std::this_thread::sleep_for(1ms); }));
 
   const auto start = std::chrono::steady_clock::now();
-  for (int i = 0; i < 10'000; ++i) ASSERT_EQ(bus->publish(as_bytes("fire and forget"), 0), ErrorCode::OK);
+  for (int i = 0; i < 10'000; ++i) ASSERT_TRUE(bus->publish(as_bytes("fire and forget"), 0));
   EXPECT_LT(std::chrono::steady_clock::now() - start, 2s);
   release = true;
 }
@@ -40,15 +40,15 @@ OverrunResult run_overrun(uint32_t producers, uint32_t slots, uint32_t message_s
   std::atomic_uint64_t delivered{0};
   uint64_t last_sequence = 0;
   bool first = true;
-  auto bus = create_bus(name, config);
-  EXPECT_EQ(bus->add_subscriber([&](const Message& m) {
+  auto bus = make_bus(name, config);
+  EXPECT_TRUE(bus->add_subscriber([&](const Message& m) {
     for (int spin = 0; spin < 2000; ++spin) std::atomic_signal_fence(std::memory_order_seq_cst); // slow consumer
     if (!check_payload(m.data).valid) ++result.corrupted;
     if (!first && m.sequence <= last_sequence) ++result.out_of_order;
     first = false;
     last_sequence = m.sequence;
     ++delivered;
-  }), ErrorCode::OK);
+  }));
 
   std::atomic_bool stop{false};
   std::atomic_uint64_t published{0};
@@ -57,7 +57,7 @@ OverrunResult run_overrun(uint32_t producers, uint32_t slots, uint32_t message_s
     threads.emplace_back([&, p] {
       uint64_t i = 0;
       while (!stop) {
-        if (bus->publish(make_payload(p, i, 16 + uint32_t(i % (message_size - 16)))) == ErrorCode::OK) ++published;
+        if (bus->publish(make_payload(p, i, 16 + uint32_t(i % (message_size - 16)))).has_value()) ++published;
         ++i;
       }
     });
@@ -101,10 +101,10 @@ TEST(BestEffort, MultipleProducersLappingEachOtherNeverCorrupt) {
 TEST(BestEffort, FastSubscriberDropsNothing) {
   ScopedBusName name;
   std::atomic_uint64_t received{0};
-  auto bus = create_bus(name, test_config(BackPressureMode::BEST_EFFORT, 1024, 64));
-  ASSERT_EQ(bus->add_subscriber([&](const Message&) { ++received; }), ErrorCode::OK);
+  auto bus = make_bus(name, test_config(BackPressureMode::BEST_EFFORT, 1024, 64));
+  ASSERT_TRUE(bus->add_subscriber([&](const Message&) { ++received; }));
   for (uint64_t i = 0; i < 10'000; ++i) {
-    ASSERT_EQ(bus->publish(make_payload(0, i, 32)), ErrorCode::OK);
+    ASSERT_TRUE(bus->publish(make_payload(0, i, 32)));
     if (i % 256 == 255) {
       ASSERT_TRUE(wait_until([&] { return received == i + 1; }));
     }

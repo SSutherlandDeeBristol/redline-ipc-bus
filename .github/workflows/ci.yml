@@ -7,12 +7,19 @@ on:
 
 jobs:
   test:
-    name: ${{ matrix.preset }}
-    runs-on: ubuntu-24.04
+    name: ${{ matrix.preset }} (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         preset: [debug, release, asan, tsan]
+        arch: [x64, arm64]
+        include:
+          - arch: x64
+            runner: ubuntu-24.04
+          # x86 orders memory strongly enough to hide most ordering bugs; ARM doesn't
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     env:
       VCPKG_ROOT: ${{ github.workspace }}/vcpkg
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg-cache
@@ -20,12 +27,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # vcpkg has no prebuilt tools for arm64 Linux, so it uses the system's
+      - name: Install build tools (arm64)
+        if: matrix.arch == 'arm64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+          echo "VCPKG_FORCE_SYSTEM_BINARIES=1" >> "$GITHUB_ENV"
+
       # Dependencies are built without sanitizers, so every preset can share one cache of them
       - name: Cache vcpkg packages
         uses: actions/cache@v4
         with:
           path: vcpkg-cache
-          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+          key: vcpkg-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('vcpkg.json') }}
 
       - name: Set up vcpkg at the manifest's baseline
         run: |

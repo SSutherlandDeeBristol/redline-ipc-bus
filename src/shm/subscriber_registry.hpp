@@ -42,10 +42,10 @@ public:
   explicit SubscriberRegistry(std::shared_ptr<SegmentMapping> segment);
 
   // Claims an entry for this process, starting at the current head of the bus with fresh metrics. Reclaims entries
-  // left behind by exited processes if the registry is full. Returns nullptr if it is still full, and throws
-  // std::runtime_error if the lease's file description can't be opened.
+  // left behind by exited processes if the registry is full. Fails with SUBSCRIBER_REGISTRY_FULL if it is still full,
+  // and SYSTEM_ERROR if the lease's file description can't be opened.
   // `flags` are SUBSCRIBER_* flags: RELIABLE subscribers hold publishers back, NO_EVICT ones are never evicted.
-  std::unique_ptr<SubscriberLease> register_subscriber(uint32_t flags = SUBSCRIBER_RELIABLE);
+  Result<std::unique_ptr<SubscriberLease>> register_subscriber(uint32_t flags = SUBSCRIBER_RELIABLE);
 
   // Lowest read_seq across live RELIABLE subscribers, or nullopt if there are none
   std::optional<uint64_t> min_read_seq() const noexcept;

@@ -33,9 +33,12 @@ void SubscriberLease::abandon() noexcept {
 SubscriberRegistry::SubscriberRegistry(std::shared_ptr<SegmentMapping> segment)
     : segment_(std::move(segment)), shm_segment_(segment_->segment()) {}
 
-std::unique_ptr<SubscriberLease> SubscriberRegistry::register_subscriber(const uint32_t flags) {
+Result<std::unique_ptr<SubscriberLease>> SubscriberRegistry::register_subscriber(const uint32_t flags) {
   // A description of our own, so the lease conflicts with every other one, including other leases in this process
   const int fd = open_lease_description(*segment_);
+  if (fd < 0) {
+    return std::unexpected(Error::SYSTEM_ERROR);
+  }
 
   auto index = try_claim(fd);
   if (!index && reap(now_ns(), 0) > 0) {
@@ -43,7 +46,7 @@ std::unique_ptr<SubscriberLease> SubscriberRegistry::register_subscriber(const u
   }
   if (!index) {
     close(fd);
-    return nullptr;
+    return std::unexpected(Error::SUBSCRIBER_REGISTRY_FULL);
   }
   auto lease = std::unique_ptr<SubscriberLease>(new SubscriberLease(segment_, *index, fd));
 

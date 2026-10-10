@@ -12,9 +12,9 @@ using namespace std::chrono_literals;
 
 TEST(Reliable, NoSubscribersNeverBlocks) {
   ScopedBusName name;
-  auto bus = create_bus(name, test_config(BackPressureMode::RELIABLE, 8));
+  auto bus = make_bus(name, test_config(BackPressureMode::RELIABLE, 8));
   for (int i = 0; i < 1000; ++i) {
-    ASSERT_EQ(bus->publish(as_bytes("nobody listening"), 0), ErrorCode::OK) << i;
+    ASSERT_TRUE(bus->publish(as_bytes("nobody listening"), 0)) << i;
   }
 }
 
@@ -23,19 +23,19 @@ TEST(Reliable, StalledSubscriberCausesBackpressureTimeoutWithoutLoss) {
   constexpr uint32_t slots = 16;
   Gate gate;
   Received received;
-  auto publisher = create_bus(name, test_config(BackPressureMode::RELIABLE, slots));
-  auto subscriber = create_bus(name, test_config(BackPressureMode::RELIABLE, slots));
-  ASSERT_EQ(subscriber->add_subscriber([&](const Message& m) {
+  auto publisher = make_bus(name, test_config(BackPressureMode::RELIABLE, slots));
+  auto subscriber = make_bus(name, test_config(BackPressureMode::RELIABLE, slots));
+  ASSERT_TRUE(subscriber->add_subscriber([&](const Message& m) {
     if (m.sequence == 0) gate.wait();
     received.add(check_payload(m.data).counter);
-  }), ErrorCode::OK);
+  }));
 
-  ASSERT_EQ(publisher->publish(make_payload(0, 0, 16), 0), ErrorCode::OK);
+  ASSERT_TRUE(publisher->publish(make_payload(0, 0, 16), 0));
   ASSERT_TRUE(wait_until([&] { return gate.has_waiter(); }));
 
   // Message 0 has been copied out and its slot released, so the ring can hold `slots` more
   uint64_t published = 1;
-  while (publisher->publish(make_payload(0, published, 16), 1000) == ErrorCode::OK) {
+  while (publisher->publish(make_payload(0, published, 16), 1000).has_value()) {
     ++published;
     ASSERT_LE(published, slots + 1) << "overran a subscriber that hasn't consumed its messages";
   }
@@ -43,7 +43,7 @@ TEST(Reliable, StalledSubscriberCausesBackpressureTimeoutWithoutLoss) {
 
   // A zero timeout returns straight away
   const auto start = std::chrono::steady_clock::now();
-  EXPECT_EQ(publisher->publish(make_payload(0, published, 16), 0), ErrorCode::BACKPRESSURE_TIMEOUT);
+  EXPECT_EQ(publisher->publish(make_payload(0, published, 16), 0), std::unexpected(Error::BACKPRESSURE_TIMEOUT));
   EXPECT_LT(std::chrono::steady_clock::now() - start, 50ms);
 
   gate.open();
@@ -53,20 +53,20 @@ TEST(Reliable, StalledSubscriberCausesBackpressureTimeoutWithoutLoss) {
   EXPECT_EQ(subscriber->get_subscriber_metrics().dropped_messages, 0u);
 
   // ...and publishing resumes
-  EXPECT_EQ(publisher->publish(make_payload(0, published, 16), 1'000'000), ErrorCode::OK);
+  EXPECT_TRUE(publisher->publish(make_payload(0, published, 16), 1'000'000));
 }
 
 TEST(Reliable, BlockingPublishResumesWhenSubscriberCatchesUp) {
   ScopedBusName name;
   std::atomic_int received{0};
-  auto bus = create_bus(name, test_config(BackPressureMode::RELIABLE, 4));
-  ASSERT_EQ(bus->add_subscriber([&](const Message&) {
+  auto bus = make_bus(name, test_config(BackPressureMode::RELIABLE, 4));
+  ASSERT_TRUE(bus->add_subscriber([&](const Message&) {
     std::this_thread::sleep_for(200us);
     ++received;
-  }), ErrorCode::OK);
+  }));
 
   // Far more messages than slots, with no timeout: every publish must eventually succeed
-  for (int i = 0; i < 200; ++i) ASSERT_EQ(bus->publish(as_bytes("slowly"), -1), ErrorCode::OK);
+  for (int i = 0; i < 200; ++i) ASSERT_TRUE(bus->publish(as_bytes("slowly"), -1));
   ASSERT_TRUE(wait_until([&] { return received == 200; }));
   EXPECT_EQ(bus->get_subscriber_metrics().dropped_messages, 0u);
 }
@@ -78,8 +78,8 @@ TEST(Reliable, MultipleProducersDeliverEverythingExactlyOnceInOrder) {
   constexpr uint64_t per_producer = 20'000;
   std::vector<uint64_t> next_expected(producers, 0);
   std::atomic_uint64_t received{0}, errors{0};
-  auto bus = create_bus(name, test_config(BackPressureMode::RELIABLE, 32, 128));
-  ASSERT_EQ(bus->add_subscriber([&](const Message& m) {
+  auto bus = make_bus(name, test_config(BackPressureMode::RELIABLE, 32, 128));
+  ASSERT_TRUE(bus->add_subscriber([&](const Message& m) {
     const auto info = check_payload(m.data);
     if (!info.valid || info.producer >= producers || info.counter != next_expected[info.producer]) {
       ++errors;
@@ -87,13 +87,13 @@ TEST(Reliable, MultipleProducersDeliverEverythingExactlyOnceInOrder) {
       ++next_expected[info.producer];
     }
     ++received;
-  }), ErrorCode::OK);
+  }));
 
   std::vector<std::thread> threads;
   for (uint32_t p = 0; p < producers; ++p) {
     threads.emplace_back([&, p] {
       for (uint64_t i = 0; i < per_producer; ++i) {
-        ASSERT_EQ(bus->publish(make_payload(p, i, 16 + uint32_t(i % 100)), 5'000'000), ErrorCode::OK);
+        ASSERT_TRUE(bus->publish(make_payload(p, i, 16 + uint32_t(i % 100)), 5'000'000));
       }
     });
   }
@@ -109,16 +109,16 @@ TEST(Reliable, SlowestSubscriberThrottlesButEveryoneGetsEverything) {
   ScopedBusName name;
   const Config config = test_config(BackPressureMode::RELIABLE, 8);
   std::atomic_int fast_count{0}, slow_count{0};
-  auto publisher = create_bus(name, config);
-  auto fast = create_bus(name, config);
-  auto slow = create_bus(name, config);
-  ASSERT_EQ(fast->add_subscriber([&](const Message&) { ++fast_count; }), ErrorCode::OK);
-  ASSERT_EQ(slow->add_subscriber([&](const Message&) {
+  auto publisher = make_bus(name, config);
+  auto fast = make_bus(name, config);
+  auto slow = make_bus(name, config);
+  ASSERT_TRUE(fast->add_subscriber([&](const Message&) { ++fast_count; }));
+  ASSERT_TRUE(slow->add_subscriber([&](const Message&) {
     std::this_thread::sleep_for(50us);
     ++slow_count;
-  }), ErrorCode::OK);
+  }));
 
-  for (int i = 0; i < 500; ++i) ASSERT_EQ(publisher->publish(as_bytes("m"), 5'000'000), ErrorCode::OK);
+  for (int i = 0; i < 500; ++i) ASSERT_TRUE(publisher->publish(as_bytes("m"), 5'000'000));
   ASSERT_TRUE(wait_until([&] { return fast_count == 500 && slow_count == 500; }));
   EXPECT_EQ(fast->get_subscriber_metrics().dropped_messages, 0u);
   EXPECT_EQ(slow->get_subscriber_metrics().dropped_messages, 0u);
@@ -130,22 +130,22 @@ TEST(Reliable, StalledSubscriberIsEvictedWhenTimeoutConfigured) {
   config.subscriber_timeout_us = 50'000;
   Gate gate;
   Received received;
-  auto publisher = create_bus(name, config);
-  auto subscriber = create_bus(name, config);
-  ASSERT_EQ(subscriber->add_subscriber([&](const Message& m) {
+  auto publisher = make_bus(name, config);
+  auto subscriber = make_bus(name, config);
+  ASSERT_TRUE(subscriber->add_subscriber([&](const Message& m) {
     if (m.sequence == 0) gate.wait();
     received.add(m.sequence);
-  }), ErrorCode::OK);
+  }));
 
   // Unlimited timeout: without eviction this would block forever
   const auto start = std::chrono::steady_clock::now();
-  for (int i = 0; i < 100; ++i) ASSERT_EQ(publisher->publish(as_bytes("m"), -1), ErrorCode::OK);
+  for (int i = 0; i < 100; ++i) ASSERT_TRUE(publisher->publish(as_bytes("m"), -1));
   EXPECT_LT(std::chrono::steady_clock::now() - start, 2s);
 
   // Once unstuck, the subscriber notices it was evicted, skips ahead and keeps receiving new messages
   gate.open();
   ASSERT_TRUE(wait_until([&] { return subscriber->get_subscriber_metrics().dropped_messages > 0; }));
-  ASSERT_EQ(publisher->publish(as_bytes("after eviction"), 1'000'000), ErrorCode::OK);
+  ASSERT_TRUE(publisher->publish(as_bytes("after eviction"), 1'000'000));
   ASSERT_TRUE(wait_until([&] { const auto v = received.values(); return !v.empty() && v.back() == 100; }));
   EXPECT_EQ(received.values(), (std::vector<uint64_t>{0, 100}));
 
@@ -158,15 +158,15 @@ TEST(Reliable, StalledSubscriberIsNotEvictedByDefault) {
   ScopedBusName name;
   const Config config = test_config(BackPressureMode::RELIABLE, 8);
   Gate gate;
-  auto publisher = create_bus(name, config);
-  auto subscriber = create_bus(name, config);
-  ASSERT_EQ(subscriber->add_subscriber([&](const Message& m) { if (m.sequence == 0) gate.wait(); }), ErrorCode::OK);
-  ASSERT_EQ(publisher->publish(as_bytes("m"), 0), ErrorCode::OK);
+  auto publisher = make_bus(name, config);
+  auto subscriber = make_bus(name, config);
+  ASSERT_TRUE(subscriber->add_subscriber([&](const Message& m) { if (m.sequence == 0) gate.wait(); }));
+  ASSERT_TRUE(publisher->publish(as_bytes("m"), 0));
   ASSERT_TRUE(wait_until([&] { return gate.has_waiter(); }));
 
-  ErrorCode last = ErrorCode::OK;
-  for (int i = 0; i < 20 && last == ErrorCode::OK; ++i) last = publisher->publish(as_bytes("m"), 200'000);
-  EXPECT_EQ(last, ErrorCode::BACKPRESSURE_TIMEOUT);
+  Result<> last;
+  for (int i = 0; i < 20 && last.has_value(); ++i) last = publisher->publish(as_bytes("m"), 200'000);
+  EXPECT_EQ(last, std::unexpected(Error::BACKPRESSURE_TIMEOUT));
 
   gate.open();
   ASSERT_TRUE(wait_until([&] { return subscriber->get_subscriber_metrics().messages_consumed == 9; }));

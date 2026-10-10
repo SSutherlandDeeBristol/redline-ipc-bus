@@ -8,6 +8,7 @@
 #include <cstring>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <thread>
@@ -61,14 +62,81 @@ inline bool wait_until(const std::function<bool()>& pred,
   return pred();
 }
 
+// Everything create_bus takes, in one struct, so tests can tweak any of it
+struct Config {
+  uint32_t max_message_size = 256;
+  uint32_t bus_size = 64;
+  uint32_t max_subscribers = 256;
+  uint32_t max_publishers = 256;
+  BackPressureMode backpressure_mode = BackPressureMode::RELIABLE;
+  OnLapped on_lapped = OnLapped::RESUME_AT_OLDEST;
+  bool zero_copy_reads = false;
+  bool latency_metrics = true;
+  int latency_histogram_significant_figures = 3;
+  int64_t consumer_busy_spin_duration_us = 10;
+  int64_t subscriber_timeout_us = 0;
+  std::optional<int> poll_thread_cpu;
+  bool prefault = false;
+  bool lock_memory = false;
+  bool huge_pages = false;
+  mode_t shm_permissions = 0600;
+  int64_t init_timeout_ms = 1000;
+
+  BusLayout layout() const {
+    return {.max_message_size = max_message_size, .bus_size = bus_size, .max_subscribers = max_subscribers,
+            .max_publishers = max_publishers};
+  }
+  BusOptions options() const {
+    BusOptions o;
+    o.backpressure_mode = backpressure_mode;
+    o.on_lapped = on_lapped;
+    o.zero_copy_reads = zero_copy_reads;
+    o.latency_metrics = latency_metrics;
+    o.latency_histogram_significant_figures = latency_histogram_significant_figures;
+    o.consumer_busy_spin_duration_us = consumer_busy_spin_duration_us;
+    o.subscriber_timeout_us = subscriber_timeout_us;
+    o.poll_thread_cpu = poll_thread_cpu;
+    o.prefault = prefault;
+    o.lock_memory = lock_memory;
+    o.huge_pages = huge_pages;
+    o.shm_permissions = shm_permissions;
+    o.init_timeout_ms = init_timeout_ms;
+    return o;
+  }
+};
+
 inline Config test_config(BackPressureMode mode = BackPressureMode::RELIABLE, uint32_t bus_size = 64,
                           uint32_t max_message_size = 256) {
   Config config;
   config.backpressure_mode = mode;
   config.bus_size = bus_size;
   config.max_message_size = max_message_size;
-  config.consumer_busy_spin_duration_us = 10;
   return config;
+}
+
+// create_bus, failing the test if it fails
+inline std::unique_ptr<Bus> make_bus(const std::string& name, const Config& config) {
+  auto bus = create_bus(name, config.layout(), config.options());
+  EXPECT_TRUE(bus.has_value()) << "create_bus failed: " << (bus ? "" : to_string(bus.error()));
+  return bus ? std::move(*bus) : nullptr;
+}
+
+// Bus::subscribe, failing the test if it fails
+inline std::unique_ptr<Subscription> subscribe(Bus& bus, const SubscriberOptions& options = {}) {
+  auto subscription = bus.subscribe(options);
+  EXPECT_TRUE(subscription.has_value()) << "subscribe failed: " << (subscription ? "" : to_string(subscription.error()));
+  return subscription ? std::move(*subscription) : nullptr;
+}
+
+// Aborts whatever `claim` holds, then claims the next slot into it
+inline Result<> claim_into(Bus& bus, Claim& claim, int64_t timeout_us = -1) {
+  claim.abort();
+  auto claimed = bus.claim(timeout_us);
+  if (!claimed) {
+    return std::unexpected(claimed.error());
+  }
+  claim = std::move(*claimed);
+  return {};
 }
 
 inline std::span<const uint8_t> as_bytes(const std::string& s) {
