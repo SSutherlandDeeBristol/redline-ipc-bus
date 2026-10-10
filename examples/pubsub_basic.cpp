@@ -1,6 +1,8 @@
 #include "redline/bus.hpp"
 
+#include <atomic>
 #include <chrono>
+#include <csignal>
 #include <iostream>
 #include <thread>
 
@@ -8,26 +10,23 @@
 
 #include "redline/utils.hpp"
 
+namespace {
+std::atomic_bool stop{false};
+}
+
 int main() {
   using namespace redline;
+
+  // Stop cleanly on Ctrl-C so the subscriber deregisters from the bus
+  std::signal(SIGINT, [](int) { stop = true; });
+  std::signal(SIGTERM, [](int) { stop = true; });
 
   Config config;
   config.bus_size = 8192;
   config.consumer_busy_spin_duration_us = 10;
-  config.backpressure_mode = BackPressureMode::BEST_EFFORT;
+  config.backpressure_mode = BackPressureMode::RELIABLE;
 
   const auto bus = create_bus("testing", config);
-
-  auto publish_thread_1 = std::thread([bus = bus.get(), config]() {
-    uint64_t counter = 0;
-    while (true) {
-      std::string message = "Hello, world! " + std::to_string(counter++);
-      auto ec = bus->publish(std::span((const uint8_t*) message.data(), message.size()), -1);
-      if (ec != ErrorCode::OK) {
-        LOG(ERROR) << "Failed to publish message: " << static_cast<int>(ec);
-      }
-    }
-  });
 
   int64_t last_time_ns = 0;
   int64_t messageCount = 0;
@@ -48,9 +47,23 @@ int main() {
     messageCount++;
   });
 
-  while (true) {
+  auto publish_thread_1 = std::thread([bus = bus.get()]() {
+    uint64_t counter = 0;
+    std::string message;
+    while (!stop) {
+      message = "Hello, world! " + std::to_string(counter++);
+      auto ec = bus->publish(std::span((const uint8_t*) message.data(), message.size()), -1);
+      if (ec != ErrorCode::OK) {
+        LOG(ERROR) << "Failed to publish message: " << static_cast<int>(ec);
+      }
+    }
+  });
+
+  while (!stop) {
     std::this_thread::sleep_for(std::chrono::seconds(1));
     const auto metrics = bus->get_subscriber_metrics();
+    // Report percentiles per interval rather than since startup
+    bus->reset_subscriber_metrics();
     LOG(INFO) << "Subscriber metrics:\nmessages_consumed=" << metrics.messages_consumed
               << "\ndropped_messages=" << metrics.dropped_messages
               << "\ncurrent_lag=" << metrics.current_lag
@@ -62,5 +75,6 @@ int main() {
               << "\np999_latency_ns=" << metrics.p999_latency_ns;
   }
 
+  publish_thread_1.join();
   return 0;
 }

@@ -1,7 +1,9 @@
 #include "futex.hpp"
 
 #include <cerrno>
+#include <ctime>
 #include <linux/futex.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 namespace redline::shm {
